@@ -432,8 +432,8 @@ static int run(decode_worker *worker,cl_kernel k,size_t count)
 {
     cl_event event=NULL;
     size_t local=(k==worker->kernels[1] || k==worker->kernels[2] || k==worker->kernels[6] || k==worker->kernels[7])?64:1;
-    if(local==64) count*=64;
     unsigned i;
+    if(local==64) count*=64;
     if(!count) return 1;
     if(fnEnqueueNDRangeKernel(worker->queue,k,1,NULL,&count,(k!=worker->kernels[3] && k!=worker->kernels[5])?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
     if(event) {

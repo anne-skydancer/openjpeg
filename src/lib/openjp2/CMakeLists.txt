@@ -136,6 +136,14 @@ if(UNIX)
 endif()
 set_target_properties(${OPENJPEG_LIBRARY_NAME} PROPERTIES ${OPENJPEG_LIBRARY_PROPERTIES})
 target_compile_options(${OPENJPEG_LIBRARY_NAME} PRIVATE ${OPENJP2_COMPILE_OPTIONS})
+# CPU fallback and OpenCL kernels must use compatible floating-point rules.
+# Override the upstream GNU Release fast-math option for accelerated builds.
+if(OPJ_ENABLE_OPENCL AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  foreach(cl_target ${INSTALL_LIBS})
+    target_compile_options(${cl_target} PRIVATE -fno-fast-math -ffp-contract=off)
+  endforeach()
+endif()
+
 
 # Install library
 install(TARGETS ${INSTALL_LIBS}
