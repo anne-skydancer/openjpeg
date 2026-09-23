@@ -16,3 +16,5 @@ scripts/opjstyle*
 
 # Ignore directories made by `make`.
 /bin/
+/build/
+__pycache__/
