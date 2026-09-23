@@ -40,6 +40,9 @@
  */
 
 #include "opj_includes.h"
+#ifdef OPJ_HAVE_OPENCL
+#include "opencl_backend.h"
+#endif
 #include "opj_common.h"
 
 // #define DEBUG_RATE_ALLOC
@@ -1490,30 +1493,45 @@ OPJ_BOOL opj_tcd_encode_tile(opj_tcd_t *p_tcd,
         }
         /* << INDEX */
 
-        /* FIXME _ProfStart(PGROUP_DC_SHIFT); */
-        /*---------------TILE-------------------*/
-        if (! opj_tcd_dc_level_shift_encode(p_tcd)) {
-            return OPJ_FALSE;
-        }
-        /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
+#ifdef OPJ_HAVE_OPENCL
+        if (!opj_opencl_encode_tile(p_tcd, p_manager))
+#endif
+        {
+#ifdef OPJ_HAVE_OPENCL
+            if (!opj_opencl_encode_transform(p_tcd, p_manager))
+#endif
+            {
+                /* FIXME _ProfStart(PGROUP_DC_SHIFT); */
+                /*---------------TILE-------------------*/
+                if (! opj_tcd_dc_level_shift_encode(p_tcd)) {
+                    return OPJ_FALSE;
+                }
+                /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
 
-        /* FIXME _ProfStart(PGROUP_MCT); */
-        if (! opj_tcd_mct_encode(p_tcd)) {
-            return OPJ_FALSE;
-        }
-        /* FIXME _ProfStop(PGROUP_MCT); */
+                /* FIXME _ProfStart(PGROUP_MCT); */
+                if (! opj_tcd_mct_encode(p_tcd)) {
+                    return OPJ_FALSE;
+                }
+                /* FIXME _ProfStop(PGROUP_MCT); */
 
-        /* FIXME _ProfStart(PGROUP_DWT); */
-        if (! opj_tcd_dwt_encode(p_tcd)) {
-            return OPJ_FALSE;
-        }
-        /* FIXME  _ProfStop(PGROUP_DWT); */
+                /* FIXME _ProfStart(PGROUP_DWT); */
+                if (! opj_tcd_dwt_encode(p_tcd)) {
+                    return OPJ_FALSE;
+                }
+                /* FIXME  _ProfStop(PGROUP_DWT); */
 
-        /* FIXME  _ProfStart(PGROUP_T1); */
-        if (! opj_tcd_t1_encode(p_tcd)) {
-            return OPJ_FALSE;
+            }
+
+            /* FIXME  _ProfStart(PGROUP_T1); */
+#ifdef OPJ_HAVE_OPENCL
+            if (!opj_opencl_encode_tier1(p_tcd, p_manager))
+#endif
+            if (! opj_tcd_t1_encode(p_tcd)) {
+                return OPJ_FALSE;
+            }
+            /* FIXME _ProfStop(PGROUP_T1); */
+
         }
-        /* FIXME _ProfStop(PGROUP_T1); */
 
         /* FIXME _ProfStart(PGROUP_RATE); */
         if (! opj_tcd_rate_allocate_encode(p_tcd, p_dest, p_max_length,
@@ -1717,6 +1735,11 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
     /* FIXME _ProfStop(PGROUP_T2); */
 
     /*------------------TIER1-----------------*/
+#ifdef OPJ_HAVE_OPENCL
+    if (opj_opencl_decode_tile(p_tcd, p_manager)) {
+        return OPJ_TRUE;
+    }
+#endif
 
     /* FIXME _ProfStart(PGROUP_T1); */
     if (! opj_tcd_t1_decode(p_tcd, p_manager)) {

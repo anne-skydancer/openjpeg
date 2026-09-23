@@ -293,6 +293,12 @@ if(BUILD_TESTING)
 endif()
 
 #-----------------------------------------------------------------------------
+option(OPJ_BUILD_OPENCL_EXPERIMENTS "Build development-only OpenCL kernel tests (not installed)." OFF)
+if(OPJ_BUILD_OPENCL_EXPERIMENTS)
+  enable_testing()
+  add_subdirectory(experimental/opencl)
+endif()
+
 # install all targets referenced as OPENJPEGTargets (relocatable with CMake 3.0+)
 install(EXPORT OpenJPEGTargets DESTINATION ${OPENJPEG_INSTALL_PACKAGE_DIR})
 include(CMakePackageConfigHelpers)
