@@ -20,6 +20,8 @@ def main():
     cpu=os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE","OPJ_OPENCL_DRIVER","OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key,None)
+    cpu["OPJ_OPENCL_DEVICE"]="off"
+    cpu["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     cases=((32,"__nonexistent_opencl_gpu__"),(4096,args.device))
     for size,device in cases:
         pgm=root/f"source-{size}.pgm"

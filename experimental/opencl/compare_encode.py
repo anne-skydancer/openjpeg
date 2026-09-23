@@ -24,6 +24,8 @@ def main():
     env=os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE","OPJ_OPENCL_ENCODE_DEVICE","OPJ_OPENCL_PROFILE","OPJ_OPENCL_WORKERS","OPJ_T1_CAPTURE_FILE"):
         env.pop(key,None)
+    env["OPJ_OPENCL_DEVICE"]="off"
+    env["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     modes=[("cpu",1,1),("cpu",1,4),("cpu",4,1),("cpu",8,1)]
     modes += [(mode,workers,1) for mode in ("baseline","candidate") for workers in (1,2,4,8)]
     results=[];expected={}

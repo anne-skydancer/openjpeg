@@ -82,10 +82,16 @@ if(NOT WIN32 AND CMAKE_COMPILER_IS_GNUCC AND CMAKE_C_COMPILER MATCHES ".*mingw32
 endif()
 
 # Build the library
-option(OPJ_ENABLE_OPENCL "Enable the opt-in experimental OpenCL decoder backend" OFF)
+set(OPJ_OPENCL_DEFAULT OFF)
+if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(OPJ_OPENCL_DEFAULT ON)
+endif()
+option(OPJ_ENABLE_OPENCL "Enable automatic OpenCL acceleration with CPU fallback" ${OPJ_OPENCL_DEFAULT})
 if(OPJ_ENABLE_OPENCL)
+  install(FILES "${OPENJPEG_SOURCE_DIR}/thirdparty/opencl/LICENSE"
+    DESTINATION "${CMAKE_INSTALL_DOCDIR}" RENAME OpenCL-Headers-LICENSE)
   find_package(Threads REQUIRED)
-  find_path(OPJ_OPENCL_INCLUDE_DIR CL/cl.h REQUIRED)
+  find_path(OPJ_OPENCL_INCLUDE_DIR CL/cl.h HINTS "${OPENJPEG_SOURCE_DIR}/thirdparty/opencl" REQUIRED)
   set(cl_bundle "/* Generated from OpenCL sources; do not edit. */\nstatic const char *const opj_cl_sources[] = {\n")
   foreach(cl_file mq_states.clh context_tables.clh t1_decode.cl reconstruct.cl t1_encode.cl forward.cl)
     set(cl_path "${OPENJPEG_SOURCE_DIR}/experimental/opencl/${cl_file}")

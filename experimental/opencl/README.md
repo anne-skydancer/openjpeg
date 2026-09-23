@@ -1,15 +1,16 @@
-# OpenCL decoder development
+# OpenCL acceleration
 
 This branch starts at OpenJPEG **v2.5.4**, commit
-`6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an optional native
-OpenCL decoding backend without changing the public OpenJPEG API.
+`6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an automatic native
+OpenCL decoding and encoding backend without changing the public OpenJPEG API.
 
 **Status: experimental concurrent GPU backend with optimized Tier-1 decoding.**
 On the qualified RX 9070 XT, the latest paired GPU comparison measured about
 **138 textures/s with four image workers**, versus **114 before this change**;
 one worker improved from **52 to 61 textures/s**. These are warm codec throughput
-measurements, not viewer FPS. The backend remains disabled by default;
-Vulkanstorm's package and shipping decoder have not been changed.
+measurements, not viewer FPS. Windows/Linux builds enable the backend by default,
+and both GPU paths select a capable device automatically. VulkanStorm package
+publication remains a separate post-merge step.
 
 ## Decoding path
 
@@ -60,11 +61,14 @@ Cross-image fusion into one kernel dispatch remains future work.
 
 ## Build and select a device
 
-The normal build needs no OpenCL headers or link library. Explicitly enabling
-`OPJ_ENABLE_OPENCL` requires Khronos headers; it dynamically loads the installed
-ICD at runtime. On Windows the DLL is loaded from System32.
+On Windows and Linux, `OPJ_ENABLE_OPENCL` defaults to ON. The required Khronos
+headers are bundled privately, so building requires no OpenCL SDK, runtime import
+library or header download. The installed ICD is loaded dynamically at runtime;
+on Windows it is loaded from System32. No installed ICD or suitable GPU means
+CPU fallback. A deliberately CPU-only build can set `OPJ_ENABLE_OPENCL=OFF`.
+Other platforms retain a CPU-only default.
 
-On Windows DLL builds, successful opt-in initialization pins the module and
+On Windows DLL builds, successful GPU initialization pins the module and
 keeps the shared OpenCL runtime for the process lifetime. The OS reclaims it at
 process exit; explicit DLL unload/reload is not a resource-reset mechanism.
 Calling the GPU driver from a DLL `atexit` handler hung during shutdown in our
@@ -73,29 +77,44 @@ restrictions, so this path deliberately avoids driver teardown there. Static
 EXE builds retain their ordinary exit cleanup. See Microsoft's
 [DLL CRT lifecycle](https://learn.microsoft.com/en-us/cpp/build/run-time-library-behavior)
 and [DllMain restrictions](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain).
-This behavior applies only after explicitly enabling the experimental backend.
+This behavior applies only after successful OpenCL initialization.
 
-The development build used Khronos OpenCL-Headers revision
-`e6060189f4ebe8b52d885c37af71b9a50c272154`, cloned into the ignored
-`build/OpenCL-Headers` directory. Set the include path to your own checkout.
+Bundled headers come from Khronos OpenCL-Headers revision
+`e6060189f4ebe8b52d885c37af71b9a50c272154`, with their Apache-2.0 license and
+notices retained in `thirdparty/opencl`. The license is included by CMake install.
 
 ```powershell
 python experimental/opencl/test_idwt53.py --list
-cmake -S . -B build/gpu -G "Visual Studio 17 2022" -A x64 -DBUILD_CODEC=ON -DBUILD_TESTING=OFF -DBUILD_THIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DOPJ_ENABLE_OPENCL=ON -DOPJ_OPENCL_INCLUDE_DIR=C:/Dev/openjpeg/build/OpenCL-Headers -DOPJ_BUILD_OPENCL_EXPERIMENTS=ON -DOPJ_OPENCL_TEST_DEVICE=gfx1201 -DOPJ_OPENCL_TEST_DRIVER=3679
+cmake -S . -B build/gpu -G "Visual Studio 17 2022" -A x64 -DBUILD_CODEC=ON -DBUILD_TESTING=OFF -DBUILD_THIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DOPJ_BUILD_OPENCL_EXPERIMENTS=ON -DOPJ_OPENCL_TEST_DEVICE=gfx1201 -DOPJ_OPENCL_TEST_DRIVER=3679
 cmake --build build/gpu --config RelWithDebInfo --parallel 8
 ctest --test-dir build/gpu -C RelWithDebInfo --output-on-failure
-$env:OPJ_OPENCL_DEVICE = 'gfx1201'
-$env:OPJ_OPENCL_DRIVER = '3679'
+# No runtime environment variables are required.
 build/gpu/bin/RelWithDebInfo/opj_decompress.exe -i input.j2k -o output.pgx
 ```
 
-Device/driver selectors are case-sensitive substrings and must select exactly
-one GPU. Two ICD versions expose gfx1201 on this machine, so the driver selector
-is material. Selection is cached on first initialization; change it in a new
-process. Unset `OPJ_OPENCL_DEVICE` for the CPU path. Set `OPJ_OPENCL_PROFILE`
-before initialization for experimental per-stage event timings.
-`OPJ_OPENCL_WORKERS` is also cached on first initialization (default 4, range
-1-8); invalid values leave decoding on the CPU.
+Automatic selection is vendor-neutral: Intel, AMD, NVIDIA and other OpenCL GPUs,
+including integrated GPUs, qualify by capabilities. Enumeration selects GPU
+devices only; CPU fallback is native OpenJPEG, not an OpenCL CPU runtime. Required
+capabilities include an available compiler, OpenCL C 1.2 or newer, little-endian
+storage, required single-precision semantics, 64-item work-groups, at least
+16 KiB local memory, and a 64 MiB maximum allocation/global-memory budget. Kernel
+compilation and per-stage validation remain additional fallback gates.
+
+Prefer discrete GPUs, then larger global memory; enumeration order breaks ties.
+No model name, vendor ID or driver version is required. Optional case-sensitive
+name/driver substring overrides can narrow selection. An explicit device name
+must select one eligible device before initialization. Once initialized, automatic
+and matching explicit selectors share that context; a different GPU requires a
+new process. Failed explicit selection does not disable automatic initialization
+for the other path.
+
+- `OPJ_OPENCL_DEVICE`: decoding override; absent, empty or `auto` selects automatically.
+- `OPJ_OPENCL_ENCODE_DEVICE`: encoding override with the same semantics.
+- Set either selector to `off` or `0` to force CPU for that path.
+- `OPJ_OPENCL_DRIVER`: optional driver substring; absent means no version pin.
+- `OPJ_OPENCL_PROFILE`: optional per-stage device-event timing.
+- `OPJ_OPENCL_WORKERS`: slot count, cached at initialization (default 4, range
+  1-8); invalid values cause CPU fallback.
 
 Hardware qualification uses the existing **AMD RX 9070 XT / driver 3679.0**.
 NVIDIA, Intel and Linux execution remain unverified; no additional hardware
@@ -254,7 +273,7 @@ dispatch. They did not improve the measured result enough to keep.
 
 ```powershell
 $inputs = Get-ChildItem build/cache-corpus/*.j2k | ForEach-Object FullName
-Remove-Item Env:OPJ_OPENCL_DEVICE -ErrorAction SilentlyContinue
+$env:OPJ_OPENCL_DEVICE = 'off'
 build/gpu/bin/RelWithDebInfo/bench_decode.exe --threads 1 5 @inputs
 build/gpu/bin/RelWithDebInfo/bench_decode.exe --threads 4 5 @inputs
 $env:OPJ_OPENCL_DEVICE = 'gfx1201'
@@ -298,7 +317,7 @@ viewer FPS gain or behavior while the GPU is simultaneously rendering a busy sim
 
 ```powershell
 $inputs = Get-ChildItem build/cache-corpus/*.j2k | ForEach-Object FullName
-Remove-Item Env:OPJ_OPENCL_DEVICE -ErrorAction SilentlyContinue
+$env:OPJ_OPENCL_DEVICE = 'off'
 build/gpu/bin/RelWithDebInfo/bench_workers.exe 4 1 5 @inputs
 $env:OPJ_OPENCL_DEVICE = 'gfx1201'
 $env:OPJ_OPENCL_DRIVER = '3679'
@@ -313,7 +332,7 @@ metadata and sample bytes; use neither option for throughput measurements.
 
 Remaining work includes improving entropy execution, evaluating cross-image
 batching, and qualification under rendering load, malformed/truncated input and
-device failure. Keep the backend opt-in until workload-level results justify it.
+device failure. These historical measurements do not qualify every GPU/driver.
 
 ## Within-block entropy experiments (2026-09-23)
 
@@ -379,14 +398,15 @@ embedded bundle. No Roger or xxjjss decoder code is copied.
 
 ## GPU encoding (2026-09-23)
 
-The optional encoder accelerates level shifting, reversible/irreversible color
+The encoder accelerates level shifting, reversible/irreversible color
 transforms, forward 5/3 or 9/7 wavelets, and style-zero Tier-1 MQ entropy coding.
 Eligible tiles also perform quantization and coefficient packing on the GPU.
 Distortion weighting, rate allocation and Tier-2 packet assembly remain on the CPU. Both lossy and lossless encoding use the existing OpenJPEG
 API. Unsupported configurations or failed GPU stages use the original CPU stage;
 results are committed only after the entire GPU stage succeeds.
 
-Encoding is disabled by default and enabled independently of decoding:
+Encoding and decoding are both automatic by default. Optional overrides for
+reproducing the qualified-device benchmark are:
 
 ```powershell
 $env:OPJ_OPENCL_ENCODE_DEVICE = 'gfx1201'
@@ -394,8 +414,8 @@ $env:OPJ_OPENCL_DRIVER = '3679'
 $env:OPJ_OPENCL_WORKERS = '4'
 ```
 
-If decoding is also enabled, use the same literal device selector for
-`OPJ_OPENCL_DEVICE`. Both paths share the worker pool and its aggregate 64 MiB
+Automatic encoding and decoding share the selected device. Explicit overrides
+should identify that same GPU. Both paths share the worker pool and its aggregate 64 MiB
 buffer limit. Driver allocations, kernels and CPU staging are additional.
 The transform path supports matching component geometry, 1-4 components,
 1-16-bit samples and dimensions up to 4096, subject to the buffer limit.
@@ -438,7 +458,7 @@ the encoded tile count. Values are mean textures/second across trials.
 GPU throughput improves about 43% losslessly and 8% lossily over one CPU thread,
 but multithreaded CPU encoding remains faster. These are current desktop
 measurements, not a controlled viewer-rendering-load qualification or a viewer
-FPS claim. Keep GPU encoding opt-in while reducing transfers and entropy cost.
+FPS claim. Transfer and entropy costs remain optimization targets.
 
 The current encoder regression matrix requires byte-identical codestreams for
 135 fused GPU cases and three fallback controls, including odd/tiled origins, short dimensions,
@@ -482,7 +502,7 @@ gains were **14% and 10%**. Four-worker throughput was roughly unchanged. The
 eight-worker staged rerun was variable and still **10%/11% slower on average**;
 no high-concurrency speedup is claimed. Preserving the smaller staged route did
 not establish that all throughput regressions are solved. The default remains
-four slots, and encoding remains opt-in.
+four slots. These measurements predate automatic device selection.
 
 CPU encoding remains competitive: the main sweep measured 71.51/77.26 textures/s
 with four CPU threads inside one image, and 82.75/105.87 with four independent
@@ -510,3 +530,15 @@ INPUTS...` (on one command line). It records corpus and executable/library hashe
 checks all output checksums, requires full GPU-stage execution, and records
 fused/staged counts. Private inputs and raw local measurements remain in ignored
 `build/`.
+
+## Automatic activation validation
+
+A fresh Windows Release configuration, without OPJ_ENABLE_OPENCL or an include
+path override, enables the backend and uses bundled headers. The automatic test
+removes every OPJ_OPENCL environment variable and requires GPU encoding and
+decoding with CPU-identical output. It also covers independent CPU overrides,
+missing device/driver fallback, sharing an automatically selected context with
+explicit selectors, and recovery from a failed decoder selector before automatic
+encoding. Reference/benchmark CPU runs now explicitly disable both GPU paths.
+Hardware execution is verified locally on AMD; Intel/NVIDIA eligibility is
+implemented without claiming hardware qualification on those devices.

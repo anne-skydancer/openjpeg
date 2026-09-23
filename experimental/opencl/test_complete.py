@@ -62,6 +62,8 @@ def main():
     cpu_env = os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE", "OPJ_OPENCL_DRIVER", "OPJ_T1_CAPTURE_FILE"):
         cpu_env.pop(key, None)
+    cpu_env["OPJ_OPENCL_DEVICE"]="off"
+    cpu_env["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     gpu_env = dict(cpu_env, OPJ_OPENCL_DEVICE=args.device, OPJ_OPENCL_DRIVER=args.driver)
     rng = random.Random(97053)
     count = components = 0

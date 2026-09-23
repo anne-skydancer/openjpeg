@@ -35,7 +35,8 @@ cmake --build build/gpu --config RelWithDebInfo --parallel 8
 
 Substitute `mq-lookahead.patch` for the second experiment. The patches are tied to
 this source revision; `git apply --check` should fail if future changes conflict.
-The runtime remains opt-in and no viewer package is changed by these experiments.
+These patches are not compiled unless applied. They do not change viewer packages;
+the normal runtime now selects a supported GPU automatically.
 
 ## Encoder coefficient cache
 

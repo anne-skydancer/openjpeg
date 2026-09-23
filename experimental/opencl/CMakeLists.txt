@@ -38,6 +38,11 @@ add_test(NAME opencl_idwt53
           --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
 set_tests_properties(opencl_idwt53 PROPERTIES LABELS "experimental;opencl" TIMEOUT 60 RUN_SERIAL TRUE)
 if(OPJ_ENABLE_OPENCL AND BUILD_CODEC)
+  add_test(NAME opencl_automatic
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_automatic.py"
+      --bin "$<TARGET_FILE_DIR:bench_encode>" --out "${CMAKE_CURRENT_BINARY_DIR}/automatic"
+      --device "${OPJ_OPENCL_TEST_DEVICE}")
+  set_tests_properties(opencl_automatic PROPERTIES LABELS "experimental;opencl" TIMEOUT 120 RUN_SERIAL TRUE)
   add_test(NAME opencl_encode_workers
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_encode_workers.py"
       --bin "$<TARGET_FILE_DIR:bench_encode>" --out "${CMAKE_CURRENT_BINARY_DIR}/encode-workers"

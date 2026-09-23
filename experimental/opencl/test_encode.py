@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""Compare CPU and opt-in GPU JPEG2000 encoding, including rate allocation."""
+"""Compare CPU and GPU JPEG2000 encoding, including rate allocation."""
 import argparse
 import os
 from pathlib import Path
@@ -29,6 +29,8 @@ def main():
     cpu=os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE","OPJ_OPENCL_ENCODE_DEVICE","OPJ_OPENCL_DRIVER","OPJ_OPENCL_WORKERS","OPJ_OPENCL_PROFILE","OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key,None)
+    cpu["OPJ_OPENCL_DEVICE"]="off"
+    cpu["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     gpu=dict(cpu,OPJ_OPENCL_ENCODE_DEVICE=args.device,OPJ_OPENCL_DRIVER=args.driver)
     rng=random.Random(2392026)
     count=0

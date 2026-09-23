@@ -21,6 +21,8 @@ def main():
     cpu = os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE", "OPJ_OPENCL_DRIVER", "OPJ_OPENCL_PROFILE", "OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key, None)
+    cpu["OPJ_OPENCL_DEVICE"]="off"
+    cpu["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     sources = []
     for size in (32, 129, 4096, 65):
         pgm = root / f"{size}.pgm"

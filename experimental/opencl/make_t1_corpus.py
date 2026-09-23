@@ -18,6 +18,8 @@ def generate(binary_dir, directory):
     decoder = binary_dir / ("opj_decompress" + suffix)
     env = os.environ.copy()
     env.pop("OPJ_T1_CAPTURE_FILE", None)
+    env["OPJ_OPENCL_DEVICE"]="off"
+    env["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     logs = []
     for size_index, (w, h) in enumerate(((17, 19), (64, 64), (129, 129))):
         patterns = [bytes([0]) * (w * h),

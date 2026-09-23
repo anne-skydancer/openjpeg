@@ -23,6 +23,8 @@ def main():
     cpu = os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE", "OPJ_OPENCL_ENCODE_DEVICE", "OPJ_OPENCL_DRIVER", "OPJ_OPENCL_WORKERS", "OPJ_OPENCL_PROFILE", "OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key, None)
+    cpu["OPJ_OPENCL_DEVICE"]="off"
+    cpu["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     sources = []
     # Three large RGB jobs cannot simultaneously fit in the 64 MiB device pool.
     # Smaller, heterogeneous jobs exercise reuse and independent kernel arguments.

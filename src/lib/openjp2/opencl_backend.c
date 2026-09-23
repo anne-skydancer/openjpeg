@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Opt-in experimental synchronous OpenCL backend. No OpenCL link dependency:
- * the installed ICD is loaded only with an explicit decoder or encoder device
- * selector. Encoding is independently enabled by OPJ_OPENCL_ENCODE_DEVICE.
+ * Automatic synchronous OpenCL backend with CPU fallback. No OpenCL link
+ * dependency: load the installed ICD when an eligible operation first needs it.
+ * Device selectors are optional overrides; an explicit off/0 disables a path.
  * Unsupported input, allocation refusal and errors use the original CPU stage.
  * Eligible concurrent calls share bounded worker slots and wait for admission.
  */
@@ -86,7 +86,7 @@ static struct {
     cl_context context;
     cl_device_id device;
     cl_program program;
-    char selector[256], driver[256];
+    char selector[256], driver[256], device_name[256], device_driver[256];
     unsigned worker_count;
     decode_worker workers[MAX_WORKERS];
 } runtime;
@@ -121,23 +121,69 @@ static void destroy_runtime(void)
     /* Keep the ICD module loaded until process teardown. */
 }
 
+/* Missing/empty/auto means automatic selection. Off and 0 are explicit CPU
+ * overrides, independent for encoding and decoding. */
+static const char *device_selector(const char *variable)
+{
+    const char *value=getenv(variable);
+    if(value && (!strcmp(value,"off") || !strcmp(value,"0")))return NULL;
+    return !value || !*value || !strcmp(value,"auto") ? "" : value;
+}
+
+/* GPU eligibility is vendor-neutral, including integrated GPUs. Check the
+ * capabilities needed by the kernels rather than a vendor/model/driver allowlist.
+ * Kernel compilation and per-stage validation provide further fallback gates. */
+static OPJ_BOOL supported_device(cl_device_id device,cl_ulong *memory,cl_bool *unified)
+{
+    cl_uint dimensions=0;
+    cl_device_fp_config fp=0;
+    OPJ_UINT32 host_endian=1;
+    cl_bool available=CL_FALSE,compiler=CL_FALSE,little=CL_FALSE;
+    cl_ulong local=0,allocation=0;
+    size_t group=0,items[3]={0};
+    char language[128]={0};int major=0,minor=0;
+#define INFO(key,value) if(fnGetDeviceInfo(device,key,sizeof(value),&(value),NULL))return OPJ_FALSE
+    if(*(const OPJ_BYTE*)&host_endian!=1)return OPJ_FALSE;
+    INFO(CL_DEVICE_SINGLE_FP_CONFIG,fp);
+    INFO(CL_DEVICE_AVAILABLE,available);INFO(CL_DEVICE_COMPILER_AVAILABLE,compiler);
+    INFO(CL_DEVICE_ENDIAN_LITTLE,little);INFO(CL_DEVICE_LOCAL_MEM_SIZE,local);
+    INFO(CL_DEVICE_MAX_MEM_ALLOC_SIZE,allocation);INFO(CL_DEVICE_MAX_WORK_GROUP_SIZE,group);
+    INFO(CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS,dimensions);
+    if(dimensions<1 || dimensions>3)return OPJ_FALSE;
+    INFO(CL_DEVICE_MAX_WORK_ITEM_SIZES,items);
+    INFO(CL_DEVICE_OPENCL_C_VERSION,language);
+#undef INFO
+    if(fnGetDeviceInfo(device,CL_DEVICE_GLOBAL_MEM_SIZE,sizeof(*memory),memory,NULL) ||
+       fnGetDeviceInfo(device,CL_DEVICE_HOST_UNIFIED_MEMORY,sizeof(*unified),unified,NULL))return OPJ_FALSE;
+    language[sizeof(language)-1]=0;
+    if(sscanf(language,"OpenCL C %d.%d",&major,&minor)!=2)return OPJ_FALSE;
+    return available && compiler && little &&
+           (fp & (CL_FP_ROUND_TO_NEAREST|CL_FP_INF_NAN)) == (CL_FP_ROUND_TO_NEAREST|CL_FP_INF_NAN) &&
+           (major>1 || (major==1 && minor>=2)) && group>=64 && items[0]>=64 &&
+           local>=16384 && allocation>=BUDGET && *memory>=BUDGET;
+}
+
 static OPJ_BOOL initialize(const char *selector, const char *driver, char *warning, size_t warning_size)
 {
     cl_platform_id platforms[32];
     cl_device_id devices[32], selected=NULL;
     cl_uint np=0, nd=0, p, d, matches=0;
+    cl_ulong best_memory=0;cl_bool best_unified=CL_TRUE;
     cl_int error;
     cl_device_fp_config fp=0;
     const char *workers=getenv("OPJ_OPENCL_WORKERS");
     char *end=NULL;
     long count=workers?strtol(workers,&end,10):4;
-    if (runtime.attempted) return runtime.context && !strcmp(selector,runtime.selector) && !strcmp(driver,runtime.driver);
-    runtime.attempted=1;
+    if(runtime.context)return (!*selector || strstr(runtime.device_name,selector)) &&
+        (!*driver || strstr(runtime.device_driver,driver));
+    /* A failed explicit override must not poison subsequent automatic calls. */
+    if(runtime.attempted && !strcmp(selector,runtime.selector) && !strcmp(driver,runtime.driver))return OPJ_FALSE;
     if(count<1 || count>MAX_WORKERS || (workers && (!*workers || *end))) return OPJ_FALSE;
     runtime.worker_count=(unsigned)count;
     if (strlen(selector)>=sizeof(runtime.selector) || strlen(driver)>=sizeof(runtime.driver)) return OPJ_FALSE;
+    runtime.attempted=1;
     strcpy(runtime.selector,selector); strcpy(runtime.driver,driver);
-    runtime.library=(void*)LIB_OPEN();
+    if(!runtime.library)runtime.library=(void*)LIB_OPEN();
     if (!runtime.library) return OPJ_FALSE;
 #define LOAD(n) do { void *address=(void*)SYMBOL(runtime.library,"cl" #n); if(!address) return OPJ_FALSE; memcpy(&fn##n,&address,sizeof(address)); } while(0);
     CL_FUNCTIONS(LOAD)
@@ -149,14 +195,25 @@ static OPJ_BOOL initialize(const char *selector, const char *driver, char *warni
         if (error || nd>32) return OPJ_FALSE;
         for (d=0;d<nd;d++) {
             char name[256]={0}, version[256]={0};
+            cl_ulong memory=0;cl_bool unified=CL_TRUE;
             if (fnGetDeviceInfo(devices[d],CL_DEVICE_NAME,sizeof(name),name,NULL) ||
                     fnGetDeviceInfo(devices[d],CL_DRIVER_VERSION,sizeof(version),version,NULL)) continue;
             name[255]=0; version[255]=0;
-            if (strstr(name,selector) && (!*driver || strstr(version,driver))) { selected=devices[d]; ++matches; }
+            if ((!*selector || strstr(name,selector)) && (!*driver || strstr(version,driver)) &&
+                    supported_device(devices[d],&memory,&unified)) {
+                ++matches;
+                /* Prefer a discrete GPU, then larger memory; enumeration order
+                 * breaks ties deterministically. Never pick an OpenCL CPU device. */
+                if(!selected || (best_unified && !unified) ||
+                   (best_unified==unified && memory>best_memory)) {
+                    selected=devices[d];best_memory=memory;best_unified=unified;
+                    strcpy(runtime.device_name,name);strcpy(runtime.device_driver,version);
+                }
+            }
         }
     }
-    if (matches!=1) {
-        snprintf(warning,warning_size,"OpenCL selector matched %u GPUs; using CPU\n",matches);
+    if (!matches || (*selector && matches!=1)) {
+        snprintf(warning,warning_size,"OpenCL selection matched %u supported GPUs; using CPU\n",matches);
         return OPJ_FALSE;
     }
     runtime.context=fnCreateContext(NULL,1,&selected,NULL,NULL,&error);
@@ -391,7 +448,7 @@ static int run(decode_worker *worker,cl_kernel k,size_t count)
 
 OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
 {
-    const char *selector=getenv("OPJ_OPENCL_DEVICE"), *driver=getenv("OPJ_OPENCL_DRIVER");
+    const char *selector=device_selector("OPJ_OPENCL_DEVICE"), *driver=getenv("OPJ_OPENCL_DRIVER");
     opj_tcd_tile_t *tile=tcd->tcd_image->tiles;
     opj_tcd_tilecomp_t *first=&tile->comps[0];
     opj_tccp_t *coding=&tcd->tcp->tccps[0];
@@ -413,7 +470,7 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     void *host[8]={0};
     OPJ_INT32 *result=NULL;
     cl_kernel kernel;
-    if(!selector || !*selector || !tcd->whole_tile_decoding || tcd->used_component ||
+    if(!selector || !tcd->whole_tile_decoding || tcd->used_component ||
             components<1 || components>4 || !levels || levels>33 || mct>1 ||
             (mct && components<3) || precision<1 || precision>16 || rev>1) return OPJ_FALSE;
     if(!driver) driver="";
@@ -556,7 +613,7 @@ static OPJ_BOOL encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager,decode_
 
 static OPJ_BOOL encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager,OPJ_BOOL fused)
 {
-    const char *selector=getenv("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
+    const char *selector=device_selector("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
     opj_tcd_tile_t *tile=tcd->tcd_image->tiles;
     OPJ_UINT32 n=0,samples=0,bytes=0,max_flags=0,c,r,b,pr,k,i,pass;
     OPJ_UINT32 *desc=NULL,*results=NULL,*map=NULL;
@@ -572,7 +629,7 @@ static OPJ_BOOL encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager,OPJ_BOOL fu
     unsigned slot=0,active=0;OPJ_UINT64 pooled=0;
     double device_ms=0,stage_ms[8]={0};
     cl_kernel kernel;
-    if(!selector||!*selector||tile->numcomps<1||tile->numcomps>4)return OPJ_FALSE;
+    if(!selector||tile->numcomps<1||tile->numcomps>4)return OPJ_FALSE;
     if(!driver)driver="";
     for(c=0;c<tile->numcomps;c++)
         if(tcd->tcp->tccps[c].cblksty || tcd->tcp->tccps[c].roishift ||
@@ -733,7 +790,7 @@ cleanup:
 
 static OPJ_BOOL encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager,decode_worker *external)
 {
-    const char *selector=getenv("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
+    const char *selector=device_selector("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
     opj_tcd_tile_t *tile=tcd->tcd_image->tiles;
     opj_tcd_tilecomp_t *first=&tile->comps[0];
     opj_tccp_t *coding=&tcd->tcp->tccps[0];
@@ -748,7 +805,7 @@ static OPJ_BOOL encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager,decode_
     OPJ_BOOL success=OPJ_FALSE;
     unsigned slot=0,active=0;OPJ_UINT64 pooled=0;
     double device_ms=0;
-    if(!selector||!*selector||!width||!height||width>4096||height>4096||
+    if(!selector||!width||!height||width>4096||height>4096||
        components<1||components>4||levels<1||levels>33||rev>1||mct>1||(mct&&components<3))return OPJ_FALSE;
     if(!driver)driver="";
     samples=width*height;
