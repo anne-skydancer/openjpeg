@@ -40,6 +40,9 @@
  */
 
 #include "opj_includes.h"
+#ifdef OPJ_HAVE_OPENCL
+#include "opencl_backend.h"
+#endif
 #include "opj_common.h"
 
 // #define DEBUG_RATE_ALLOC
@@ -1717,6 +1720,11 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
     /* FIXME _ProfStop(PGROUP_T2); */
 
     /*------------------TIER1-----------------*/
+#ifdef OPJ_HAVE_OPENCL
+    if (opj_opencl_decode_tile(p_tcd, p_manager)) {
+        return OPJ_TRUE;
+    }
+#endif
 
     /* FIXME _ProfStart(PGROUP_T1); */
     if (! opj_tcd_t1_decode(p_tcd, p_manager)) {

@@ -60,10 +60,16 @@ def verify_batch(program, blocks):
     cl = program.cl
     desc, segments, reference = [], [], []
     payload = bytearray()
-    for b in blocks:
+    flag_offsets=[]
+    flag_cells=0
+    for start in range(0,len(blocks),32):
+        group=blocks[start:start+32]
+        flag_offsets.extend(flag_cells+i for i in range(len(group)))
+        flag_cells+=32*max(b["width"]*b["height"] for b in group)
+    for block_index,b in enumerate(blocks):
         desc.extend((b["width"], b["height"], b["orientation"], b["numbps"], b["style"],
                      len(payload), len(b["payload"]), len(segments)//2, len(b["segments"]), len(reference),
-                     b["roi"], b["check_pterm"]))
+                     b["roi"], b["check_pterm"], flag_offsets[block_index]))
         for segment in b["segments"]:
             segments.extend(segment)
         payload.extend(b["payload"])
@@ -73,7 +79,7 @@ def verify_batch(program, blocks):
               (UINT * max(1, len(segments)))(*segments),
               (ct.c_ubyte * max(1, len(payload)))(*payload),
               (INT * len(reference))(*([123456789] * len(reference))),
-              (ct.c_ubyte * len(reference))(*([255] * len(reference))),
+              (UINT * flag_cells)(*([0xffffffff] * flag_cells)),
               (UINT * len(blocks))(*([99] * len(blocks)))]
     buffers = []
     try:

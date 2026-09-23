@@ -1,149 +1,174 @@
 # OpenCL decoder development
 
-This branch starts from upstream **v2.5.4**, commit
-`6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`, matching Vulkanstorm's current
-OpenJPEG source version. The goal is GPU Tier-1 entropy decoding and full
-reconstruction inside OpenJPEG, retaining CPU parsing and compatibility.
+This branch starts at OpenJPEG **v2.5.4**, commit
+`6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an optional native
+OpenCL decoding backend without changing the public OpenJPEG API.
 
-## Implemented first slice
+**Status: functional experimental backend, not a performance win.** On the
+current RX 9070 XT corpus, the optimized GPU path is about three times slower
+than the single-thread CPU path. It remains disabled by default. Vulkanstorm's
+package and shipping decoder have not been changed.
 
-- OpenCL C 1.2 inverse reversible 5/3 lifting kernels, with separate update and
-  prediction dispatches. Both origin parities and single-sample cases are handled.
-- Strided rows/columns and multiple independent lines per dispatch. Coefficients
-  currently arrive interleaved, not in OpenJPEG's packed subband layout.
-- A standard-library Python runner using the installed OpenCL ICD through ctypes.
-  It compiles once and reuses the context, queue and kernels across cases. It
-  requires explicit device selection and rejects ambiguous selections.
-- Exact round-trip tests using independent CPU forward lifting. Signals include
-  impulses, ramps, constants, alternating extremes and deterministic random data.
-  Oversized dispatches and sentinel padding check bounds handling.
+## Decoding path
 
-The runner is development infrastructure, not the production C backend. It uses
-an in-order queue to establish the dependency between the two kernels. There is
-no kernel timing or speedup claim. The existing library decoding path is unchanged.
+The CPU parses the codestream and performs Tier-2 packet processing. After that,
+`opencl_backend.c` validates and copies a bounded tile plan, then runs:
 
-## Reproduce on this machine
+1. Tier-1 MQ/RAW entropy decoding, context resets, vertical causal contexts,
+   segmentation symbols, ROI recovery and predictable-termination diagnostics.
+2. Subband placement and dequantization.
+3. Multilevel reversible 5/3 or irreversible 9/7 inverse wavelet reconstruction.
+4. Reversible/irreversible component transform, level shift and output clamping.
+
+Coefficients and reconstructed planes remain on the GPU between these stages.
+The final planar integer samples return through the existing OpenJPEG API.
+This is not direct GPU texture upload or asynchronous viewer integration.
+
+A persistent context, in-order queue, program and kernels are reused. Job
+buffers currently allocate per tile; pooling and cross-image batching are still
+future work. The entropy kernel assigns one work-item per code block. Cached
+neighbor flags, packed MQ contexts and 32-lane interleaved scratch reduce its
+cost; the layout does not require vendor extensions or a particular wave size.
+
+## Build and select a device
+
+The normal build needs no OpenCL headers or link library. Explicitly enabling
+`OPJ_ENABLE_OPENCL` requires Khronos headers; it dynamically loads the installed
+ICD at runtime. On Windows the DLL is loaded from System32.
+
+The development build used Khronos OpenCL-Headers revision
+`e6060189f4ebe8b52d885c37af71b9a50c272154`, cloned into the ignored
+`build/OpenCL-Headers` directory. Set the include path to your own checkout.
 
 ```powershell
 python experimental/opencl/test_idwt53.py --list
-python experimental/opencl/test_idwt53.py --device gfx1201 --driver 3679
-
-cmake -S . -B build/cpu-reference -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DBUILD_CODEC=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_THIRDPARTY=ON -DOPJ_BUILD_OPENCL_EXPERIMENTS=ON -DOPJ_OPENCL_TEST_DEVICE=gfx1201 -DOPJ_OPENCL_TEST_DRIVER=3679
-cmake --build build/cpu-reference --config RelWithDebInfo --parallel 8
-ctest --test-dir build/cpu-reference -C RelWithDebInfo --output-on-failure -R "^(opencl_idwt53|tte[0-5]|ttd[0-2]|rta[1-5]|testempty[0-2])$"
+cmake -S . -B build/gpu -G "Visual Studio 17 2022" -A x64 -DBUILD_CODEC=ON -DBUILD_TESTING=OFF -DBUILD_THIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DOPJ_ENABLE_OPENCL=ON -DOPJ_OPENCL_INCLUDE_DIR=C:/Dev/openjpeg/build/OpenCL-Headers -DOPJ_BUILD_OPENCL_EXPERIMENTS=ON -DOPJ_OPENCL_TEST_DEVICE=gfx1201 -DOPJ_OPENCL_TEST_DRIVER=3679
+cmake --build build/gpu --config RelWithDebInfo --parallel 8
+ctest --test-dir build/gpu -C RelWithDebInfo --output-on-failure
+$env:OPJ_OPENCL_DEVICE = 'gfx1201'
+$env:OPJ_OPENCL_DRIVER = '3679'
+build/gpu/bin/RelWithDebInfo/opj_decompress.exe -i input.j2k -o output.pgx
 ```
 
-Device and driver strings are local selections, not requirements for the kernels.
-Two driver versions expose gfx1201 on this machine; do not silently choose one.
-Hardware validation currently uses the existing **RX 9070 XT only**. No NVIDIA or
-Intel purchase/testing prerequisite is part of this project. Other devices remain
-unverified; the code does not use a vendor whitelist or vendor extensions.
+Device/driver selectors are case-sensitive substrings and must select exactly
+one GPU. Two ICD versions expose gfx1201 on this machine, so the driver selector
+is material. Selection is cached on first initialization; change it in a new
+process. Unset `OPJ_OPENCL_DEVICE` for the CPU path. Set `OPJ_OPENCL_PROFILE`
+before initialization for experimental per-stage event timings.
 
-OpenCL experiments are off by default and nothing here is installed with openjp2.
-The host checks geometry, non-overlapping line layouts, buffer bounds and a
-restricted coefficient range before dispatch. This is not yet a hardened interface
-for arbitrary JPEG2000 bitstreams.
+Hardware qualification uses the existing **AMD RX 9070 XT / driver 3679.0**.
+NVIDIA, Intel and Linux execution remain unverified; no additional hardware
+purchase is a prerequisite. The implementation uses standard OpenCL C 1.2.
 
-## Next implementation work
+## Eligibility and fallback
 
-Verified initial checkpoint (2026-09-23): the RelWithDebInfo reference build
-completed, and all 18 selected CTest cases passed (17 upstream self-contained
-tests plus the OpenCL test). The GPU test passed 68 batches / 80,784 exact samples
-on gfx1201, driver 3679.0. This is a selected test set, not the full external
-OpenJPEG regression corpus. Test logs are in the ignored build directory.
+The current backend accepts whole-tile decoding with one to four components,
+matching component geometry/resolutions/precision/signedness, precision up to
+16 bits, standard component transforms, and traditional Part 1 code blocks.
+Reduced resolutions and reduced quality layers are supported. Component
+selection, partial-area decoding, heterogeneous components, custom transforms
+and HTJ2K use CPU decoding. Tile dimensions are limited to 4096 and combined
+per-job device buffers to **64 MiB**; host staging is additional.
 
-1. Broaden ROI coverage beyond component-wide upshift and exercise additional
-   precision, origin and malformed-input cases against the CPU reference.
-2. Add independently produced/real texture inputs, progressive quality layers and
-   failure cases, retaining exact intermediate parity.
-3. Add subband placement, multilevel 2-D reconstruction, 9/7 and final component
-   conversion. Compare against the actual OpenJPEG decoder, including reduced
-   resolutions, boundaries and truncated input.
-4. Implement the production C runtime with bounded pools, event ownership and
-   CPU retry, then integrate the complete path in the third-party package.
-5. Add asynchronous viewer integration and evaluate texture readiness, frame
-   pacing and working-set use on the RX 9070 XT.
+A nonblocking process-wide lock admits one GPU job. Other decoder workers use
+the CPU if it is busy. Unsupported input, unavailable/ambiguous devices,
+allocation refusal and OpenCL errors fall back to CPU. Host tile output is
+committed only after the entire GPU job and final readback succeed. This is
+not yet complete malformed-input, concurrency or device-loss qualification.
 
-The current tests do not prove full JPEG2000 compatibility, multilevel transform
-correctness, entropy throughput or an end-to-end performance gain.
+## Validation
 
-## Tier-1 MQ/RAW checkpoint
+Tests compare decoded PGX component files byte for byte and require a GPU
+completion record for **every** tile, preventing silent CPU fallback from
+passing a GPU correctness test. The native suite exercises 8-bit grayscale,
+two-channel, RGB and RGBA data, odd origins, singleton dimensions, tiled
+images, both transforms, all style flags together, reduced resolution and
+first-layer decoding. Separate cases exercise signed and unsigned 16-bit data. All **156 cases /
+392 component images** passed on the qualified device.
 
-`t1_decode.cl` now decodes compressed code blocks on the GPU, with one work-item
-per block. It implements the MQ arithmetic decoder, significance/sign decoding,
-magnitude refinement, cleanup aggregation, context reset, terminated segments,
-RAW bypass with byte stuffing, vertical causal contexts, segmentation symbols,
-ROI bitplane decoding/shift reversal and predictable-termination diagnostics.
-MQ states are generated from the pinned upstream table as
-integer indices, retaining upstream notices. Tests verify the generated file is
-current. HTJ2K remains outside this kernel's accepted domain. This does not
-establish complete Part 1 conformance or production-ready error handling.
+`test_fallback.py` checks exact CPU output for an invalid device selector and
+for a 4096-square image exceeding the device working budget. A separate clean
+RelWithDebInfo CPU-only library builds without either the OpenCL selector or
+reference-capture environment-variable string. The OpenCL-enabled
+RelWithDebInfo shared DLL also builds successfully; 17 selected upstream
+self-contained CPU regression tests pass (not the full external-data suite).
 
-`OPJ_CAPTURE_T1_REFERENCES=ON` adds an opt-in development hook to the CPU decoder.
-`OPJ_T1_CAPTURE_FILE` selects a per-process JSONL file. Each record contains
-geometry, subband/component/resolution metadata, style, quantization parameters,
-compressed segments and **CPU coefficients after ROI undo, before scaling**.
-Capture version 2 explicitly labels this boundary `post_roi`; older captures must
-be regenerated. It also records whether OpenJPEG performed its PTERM check and
-the resulting diagnostic category. Records
-are serialized under the existing decoder job mutex. Separate processes/codecs
-must use separate output files. This option has no effect unless OpenCL experiments
-are enabled; normal builds contain no capture hook.
+The Tier-1 reference corpus covers all 64 combinations of
+BYPASS/RESET/TERMALL/VSC/PTERM/SEGSYM, multiple block/image sizes, two transforms,
+ROI shifts, full/reduced resolutions and first-layer-only decoding:
 
-`make_t1_corpus.py` creates deterministic grayscale codestreams using constant,
-ramp and random signals, three image sizes (including odd sizes), all 64
-combinations of BYPASS/RESET/TERMALL/VSC/PTERM/SEGSYM, both wavelet transforms and
-full/reduced resolution decoding. Each codestream has two quality layers and is
-also decoded with only the first quality layer. Code blocks include partial
-blocks, 16x16 and up to 64x64.
-Constant/ramp patterns exercise component-wide ROI shifts 3/5, while random
-patterns retain the non-ROI path. OpenJPEG's command-line ROI option upshifts an
-entire component; spatial ROI masks from other encoders still need testing.
-This is a synthetic corpus generated by OpenJPEG, not yet a captured viewer corpus
-or an independent encoder interoperability suite.
+- 1,152 synthetic codestreams, 29,184 code blocks.
+- **18,224,256 exact CPU/GPU coefficient matches**, including 19,456 ROI blocks.
+- All 8,448 enabled PTERM checks agree, including 24 synthesized-marker and
+  nine remaining-byte diagnostics.
 
-`test_t1.py` validates and flattens capture records into experimental descriptors,
-then compares every GPU coefficient directly to the CPU reference in bounded
-128-block batches. It checks GPU status, initializes output/scratch to sentinels,
-and deliberately over-dispatches to exercise the block-count guard. Synthetic
-malformed descriptors are rejected before submission by `test_t1_validation.py`.
-The descriptor format is not yet a public ABI or a hardened untrusted-input API.
-
-Verified on RX 9070 XT / driver 3679.0: **29,184 blocks and 18,224,256 coefficients
-match the CPU exactly**, including full 64x64 blocks and 19,456 ROI blocks.
-All **8,448 enabled PTERM checks** agree with the CPU, including 24 synthesized
-marker diagnostics and 9 remaining-byte diagnostics. The corpus contains 1,152
-codestreams, each decoded at full
-resolution, reduced resolution, and first-layer-only quality. Host validation
-rejects a descriptor that mixes MQ and RAW passes within one segment. A separate
-RelWithDebInfo build with experiments disabled previously succeeded and contains
-no capture environment-variable string. No throughput or end-to-end speedup has
-been measured.
+`OPJ_CAPTURE_T1_REFERENCES=ON` requires the development experiments option and
+adds the CPU hook selected by `OPJ_T1_CAPTURE_FILE`. Capture version 2 records
+coefficients after ROI recovery and before scaling, plus the CPU's PTERM check
+decision and diagnostic. Records are serialized under the decoder mutex;
+separate codecs/processes must use separate files. Normal builds have no hook.
 
 ```powershell
-cmake -S . -B build/cpu-reference -DOPJ_CAPTURE_T1_REFERENCES=ON
+cmake -S . -B build/cpu-reference -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON -DBUILD_CODEC=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_THIRDPARTY=ON -DOPJ_BUILD_OPENCL_EXPERIMENTS=ON -DOPJ_CAPTURE_T1_REFERENCES=ON -DOPJ_OPENCL_TEST_DEVICE=gfx1201 -DOPJ_OPENCL_TEST_DRIVER=3679
 cmake --build build/cpu-reference --config RelWithDebInfo --parallel 8
-ctest --test-dir build/cpu-reference -C RelWithDebInfo --output-on-failure -R "^opencl_"
+ctest --test-dir build/cpu-reference -C RelWithDebInfo --output-on-failure -R "^(opencl_.*|tte[0-5]|ttd[0-2]|rta[1-5]|testempty[0-2])$"
 ```
 
-CTest generates its corpus as a fixture before running Tier-1 parity. Captures
-and logs remain under the ignored build directory. A capture failure fails the
-experimental CPU decode. The GPU kernel consumes an unexpected segmentation
-symbol and records diagnostic bit 256 without failing, matching upstream's
-non-rejection behavior (upstream's warning code is commented out). PTERM
-diagnostics are also nonfatal: 512 means remaining bytes, 1024 means more than
-two synthesized markers, with the same precedence and check gating as the CPU.
-Partial-quality decoding follows the captured CPU check decision. Status bits
-0-7 remain fatal errors. This corrects the earlier
-prototype's overly strict rejection. Arbitrarily truncated network payloads and
-malformed codestream interoperability still require separate qualification.
+The standalone 5/3 tests cover 68 batches / 80,784 exact samples. Descriptor
+validation tests reject inconsistent geometry, modes and unsupported styles.
+PTERM diagnostics (512/1024) and segmentation-symbol diagnostics (256) remain
+nonfatal to match upstream; bits 0-7 indicate fatal kernel errors.
 
-Next: extend entropy mode coverage, add independently produced/real texture
-inputs, then connect coefficient placement to multilevel reconstruction. The
-OpenJPEG decoding API and Vulkanstorm package still execute their CPU path.
+With the owner's permission, `extract_cache_corpus.py` reconstructed **32 real
+textures** from read-only copies of the viewer's indexed 600-byte prefixes and
+body files. The source cache was not modified. The private corpus and manifest
+remain under ignored `build/cache-corpus`, not in Git. All **96 full/reduced
+resolution decodes / 336 component images** matched the CPU exactly with every
+tile decoded on the GPU. These tests do not establish complete Part 1
+conformance, independent-encoder interoperability, arbitrary truncated-payload
+handling or viewer image quality across every texture.
+
+## Performance evidence (2026-09-23)
+
+`bench_decode` is a development-only public-API benchmark. It decodes the 32
+cached textures in one process, excludes its first corpus pass from the warm
+mean, uses one CPU decoding thread and includes identical output checksumming
+in both modes. Files are warm; context/program initialization is excluded from
+the GPU warm mean. Three measured rounds give 96 warm decodes per mode.
+
+| Path | Mean time per texture |
+| --- | ---: |
+| CPU | 25.514 ms |
+| Initial complete GPU backend | 142.002 ms |
+| Cached neighbor contexts | 89.653 ms |
+| Packed MQ contexts | 81.154 ms |
+| Interleaved flag scratch | **75.311 ms** |
+
+CPU and GPU output checksums agree. The optimized GPU path takes about 47%
+less time than the initial GPU version, but remains **2.95 times slower than
+CPU**. Profiling after the neighbor-context optimization attributed about
+74.8 ms to Tier-1 and 7.2 ms to DWT per warm texture; placement and finishing
+were much smaller. This identifies Tier-1 as the main optimization target,
+without proving a specific hardware cause. These are codec timings, not viewer
+FPS or texture-arrival measurements.
+
+```powershell
+$inputs = Get-ChildItem build/cache-corpus/*.j2k | ForEach-Object FullName
+Remove-Item Env:OPJ_OPENCL_DEVICE -ErrorAction SilentlyContinue
+build/gpu/bin/RelWithDebInfo/bench_decode.exe 3 @inputs
+$env:OPJ_OPENCL_DEVICE = 'gfx1201'
+$env:OPJ_OPENCL_DRIVER = '3679'
+build/gpu/bin/RelWithDebInfo/bench_decode.exe 3 @inputs
+```
+
+The next performance work is entropy execution/scheduling and larger batches
+across independent textures, followed by buffer reuse and more parallel wavelet
+reconstruction. Further qualification must cover malformed/truncated streams,
+contention and device failure before package/viewer integration. Do not enable
+this backend by default based on functionality alone.
 
 ## Provenance
 
-Kernel lifting semantics follow the reversible JPEG2000 transform, with boundary
-behavior checked against OpenJPEG v2.5.4 `src/lib/openjp2/dwt.c`. New files use the
-repository's BSD-2-Clause licensing. No Roger or xxjjss decoder code is copied.
+Kernel behavior follows OpenJPEG v2.5.4 `t1.c`, `mqc.c`, `dwt.c`, `mct.c` and
+`tcd.c`. Upstream BSD notices are retained in adapted kernel sources and the
+embedded bundle. No Roger or xxjjss decoder code is copied.

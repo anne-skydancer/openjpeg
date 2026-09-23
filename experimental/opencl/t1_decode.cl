@@ -44,7 +44,7 @@
  * Experimental Part 1 MQ/RAW path, ROI undo and PTERM diagnostics; no HT.
  * This is a correctness implementation, not an optimized production backend.
  */
-typedef struct { uint a, c, ct, pos, synthesized; uint context[19]; } MQ;
+typedef struct { uint a, c, ct, pos, synthesized; uint ctx0, ctx1, ctx2, ctx3, ctx4; } MQ;
 
 uint input_byte(__global const uchar *src, uint length, uint pos)
 {
@@ -58,10 +58,23 @@ void bytein(MQ *m, __global const uchar *src, uint length)
         else { ++m->pos; m->c += next << 9; m->ct = 7; }
     } else { ++m->pos; m->c += next << 8; m->ct = 8; }
 }
+uint context_state(MQ *m,uint context)
+{
+    uint word=context<4 ? m->ctx0 : context<8 ? m->ctx1 : context<12 ? m->ctx2 : context<16 ? m->ctx3 : m->ctx4;
+    return (word >> ((context&3)*8)) & 255;
+}
+void set_context(MQ *m,uint context,uint state)
+{
+    uint shift=(context&3)*8,mask=~(255u<<shift),value=state<<shift;
+    if(context<4) m->ctx0=(m->ctx0&mask)|value;
+    else if(context<8) m->ctx1=(m->ctx1&mask)|value;
+    else if(context<12) m->ctx2=(m->ctx2&mask)|value;
+    else if(context<16) m->ctx3=(m->ctx3&mask)|value;
+    else m->ctx4=(m->ctx4&mask)|value;
+}
 void reset_contexts(MQ *m)
 {
-    for (uint i = 0; i < 19; ++i) m->context[i] = 0;
-    m->context[0] = 8; m->context[17] = 6; m->context[18] = 92;
+    m->ctx0=8; m->ctx1=0; m->ctx2=0; m->ctx3=0; m->ctx4=(6u<<8)|(92u<<16);
 }
 uint raw_decision(MQ *m, __global const uchar *src, uint length)
 {
@@ -82,18 +95,18 @@ void init_segment(MQ *m, __global const uchar *src, uint length)
 }
 uint decision(MQ *m, __global const uchar *src, uint length, uint context)
 {
-    uint4 s = mq_states[m->context[context]]; /* Qe, MPS, NMPS, NLPS */
+    uint4 s = mq_states[context_state(m,context)]; /* Qe, MPS, NMPS, NLPS */
     uint bit;
     m->a -= s.x;
     if ((m->c >> 16) < s.x) {
-        if (m->a < s.x) { bit = s.y; m->context[context] = s.z; }
-        else { bit = 1 - s.y; m->context[context] = s.w; }
+        if (m->a < s.x) { bit = s.y; set_context(m,context,s.z); }
+        else { bit = 1 - s.y; set_context(m,context,s.w); }
         m->a = s.x;
     } else {
         m->c -= s.x << 16;
         if (m->a & 0x8000) return s.y;
-        if (m->a < s.x) { bit = 1 - s.y; m->context[context] = s.w; }
-        else { bit = s.y; m->context[context] = s.z; }
+        if (m->a < s.x) { bit = 1 - s.y; set_context(m,context,s.w); }
+        else { bit = s.y; set_context(m,context,s.z); }
     }
     do {
         if (!m->ct) bytein(m, src, length);
@@ -101,27 +114,25 @@ uint decision(MQ *m, __global const uchar *src, uint length, uint context)
     } while (m->a < 0x8000);
     return bit;
 }
-int significant(__global const uchar *flags, int x, int y, int w, int h)
+/* Cache neighboring significance and sign bits per coefficient. A newly
+ * significant sample updates adjacent contexts once, instead of each future
+ * coding decision gathering eight separate global-memory neighbors.
+ * Low 9 bits are a 3x3 significance map (self at bit 4); sign map at bits 16..24.
+ * VISITED=512, REFINED=1024. VSC suppresses northward propagation at stripe starts.
+ */
+#define F(at) flags[(at)*32]
+#define SIG 16u
+#define VISITED 512u
+#define REFINED 1024u
+#define NEIGHBORS 495u
+int neighbors(__global const uint *flags, int x, int y, int w, int h, uint style)
 {
-    return x >= 0 && y >= 0 && x < w && y < h ? (flags[y*w+x] & 1) : 0;
+    return (F(y*w+x) & NEIGHBORS) != 0;
 }
-int neighbors(__global const uchar *flags, int x, int y, int w, int h, uint style)
+uint zero_context(__global const uint *flags, int x, int y, int w, int h, uint orient, uint style)
 {
-    if ((style & 8) && (y & 3) == 3) h = min(h,y+1);
-    int n = 0;
-    for (int dy = -1; dy <= 1; ++dy)
-        for (int dx = -1; dx <= 1; ++dx)
-            if (dx || dy) n += significant(flags, x+dx, y+dy, w, h);
-    return n;
-}
-uint zero_context(__global const uchar *flags, int x, int y, int w, int h, uint orient, uint style)
-{
-    if ((style & 8) && (y & 3) == 3) h = min(h,y+1);
-    int hc = significant(flags,x-1,y,w,h)+significant(flags,x+1,y,w,h);
-    int vc = significant(flags,x,y-1,w,h)+significant(flags,x,y+1,w,h);
-    int dc = significant(flags,x-1,y-1,w,h)+significant(flags,x+1,y-1,w,h)
-           + significant(flags,x-1,y+1,w,h)+significant(flags,x+1,y+1,w,h);
-    /* OpenJPEG's stored orientation swaps the generator's HL/LH indices. */
+    uint f=F(y*w+x);
+    int hc=popcount(f & 40u), vc=popcount(f & 130u), dc=popcount(f & 325u);
     if (orient == 1) { int t = hc; hc = vc; vc = t; }
     if (orient == 3) {
         int hv = hc + vc;
@@ -132,47 +143,53 @@ uint zero_context(__global const uchar *flags, int x, int y, int w, int h, uint 
     return hc == 0 ? (vc == 0 ? (dc == 0 ? 0 : dc == 1 ? 1 : 2) : vc == 1 ? 3 : 4) :
            hc == 1 ? (vc == 0 ? (dc == 0 ? 5 : 6) : 7) : 8;
 }
-int signed_neighbor(__global const int *data, __global const uchar *flags,
-                    int x, int y, int w, int h)
+int sign_contribution(uint f,uint bit)
 {
-    return significant(flags,x,y,w,h) ? (data[y*w+x] < 0 ? -1 : 1) : 0;
+    return (f & (1u<<bit)) ? ((f & (1u<<(bit+16))) ? -1 : 1) : 0;
 }
 void decode_sign(MQ *m, __global const uchar *src, uint length,
-                 __global int *data, __global uchar *flags,
+                 __global int *data, __global uint *flags,
                  int x, int y, int w, int h, int value, uint style, uint raw)
 {
-    if ((style & 8) && (y & 3) == 3) h = min(h,y+1);
-    int hc = clamp(signed_neighbor(data,flags,x-1,y,w,h)+signed_neighbor(data,flags,x+1,y,w,h),-1,1);
-    int vc = clamp(signed_neighbor(data,flags,x,y-1,w,h)+signed_neighbor(data,flags,x,y+1,w,h),-1,1);
+    uint f=F(y*w+x);
+    int hc=clamp(sign_contribution(f,3)+sign_contribution(f,5),-1,1);
+    int vc=clamp(sign_contribution(f,1)+sign_contribution(f,7),-1,1);
     uint prediction = hc < 0 || (hc == 0 && vc < 0);
     if (hc < 0) { hc = -hc; vc = -vc; }
     uint context = 9 + (hc == 0 ? (vc == 0 ? 0 : 1) : vc == -1 ? 2 : vc == 0 ? 3 : 4);
     uint sign = raw ? raw_decision(m,src,length) : decision(m,src,length,context) ^ prediction;
     data[y*w+x] = sign ? -value : value;
-    flags[y*w+x] |= 1;
+    F(y*w+x) |= SIG;
+    for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx) {
+        int tx=x+dx,ty=y+dy;
+        if((dx==0 && dy==0) || tx<0 || tx>=w || ty<0 || ty>=h) continue;
+        if((style&8) && (y&3)==0 && dy==-1) continue;
+        uint bit=(1-dy)*3+(1-dx);
+        F(ty*w+tx) |= (1u<<bit) | (sign<<(bit+16));
+    }
 }
 
 /* Descriptor: w,h,orientation,numbps,style,inputOffset,inputLength,
- * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm.
+ * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm,scratchOffset.
  * Segments: length, passCount.
  * Host verifies every range before upload; each block owns disjoint scratch.
  */
 __kernel void decode_blocks(__global const uint *desc, __global const uint2 *segments,
                             __global const uchar *input, __global int *output,
-                            __global uchar *scratch, __global uint *status, uint count)
+                            __global uint *scratch, __global uint *status, uint count)
 {
     size_t block = get_global_id(0);
     if (block >= count) return;
-    __global const uint *d = desc + block*12;
+    __global const uint *d = desc + block*13;
     int w = d[0], h = d[1];
     uint orient = d[2], style = d[4], offset = 0;
     __global int *data = output + d[9];
-    __global uchar *flags = scratch + d[9];
+    __global uint *flags = scratch + d[12];
     status[block] = 0;
     if (style & ~63u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30 || d[10] > 30 || d[3]+d[10] > 30) {
         status[block] = 1; return;
     }
-    for (int i = 0; i < w*h; ++i) { data[i] = 0; flags[i] = 0; }
+    for (int i = 0; i < w*h; ++i) { data[i] = 0; F(i) = 0; }
     MQ m; reset_contexts(&m); m.synthesized = 0;
     int bp = d[3]+d[10]; uint pass = 2, last_length = 0;
     for (uint seg = 0; seg < d[8]; ++seg) {
@@ -193,7 +210,7 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
                     if (pass == 2 && rows == 4) {
                         int aggregate = 1;
                         for (int j = 0; j < 4; ++j)
-                            if ((flags[(stripe+j)*w+x] & 3) || neighbors(flags,x,stripe+j,w,h,style)) aggregate = 0;
+                            if ((F((stripe+j)*w+x) & (SIG|VISITED)) || neighbors(flags,x,stripe+j,w,h,style)) aggregate = 0;
                         if (aggregate) {
                             if (!decision(&m,src,s.x,17)) continue;
                             start = (int)decision(&m,src,s.x,18) << 1;
@@ -203,24 +220,24 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
                     for (int j = start; j < rows; ++j) {
                         int y = stripe+j, at = y*w+x;
                         if (pass == 1) {
-                            if ((flags[at] & 3) == 1) {
-                                uint context = 14 + ((flags[at] & 4) ? 2 : neighbors(flags,x,y,w,h,style) ? 1 : 0);
+                            if ((F(at) & (SIG|VISITED)) == SIG) {
+                                uint context = 14 + ((F(at) & REFINED) ? 2 : neighbors(flags,x,y,w,h,style) ? 1 : 0);
                                 uint bit = raw ? raw_decision(&m,src,s.x) : decision(&m,src,s.x,context);
                                 data[at] += (bit ^ (data[at] < 0)) ? midpoint : -midpoint;
-                                flags[at] |= 4;
+                                F(at) |= REFINED;
                             }
-                        } else if (!(flags[at] & 3)) {
+                        } else if (!(F(at) & (SIG|VISITED))) {
                             if (pass == 0 && !neighbors(flags,x,y,w,h,style)) continue;
                             uint bit = forced ? 1 : raw ? raw_decision(&m,src,s.x) : decision(&m,src,s.x,zero_context(flags,x,y,w,h,orient,style));
                             forced = 0;
                             if (bit) decode_sign(&m,src,s.x,data,flags,x,y,w,h,value,style,raw);
-                            if (pass == 0) flags[at] |= 2;
+                            if (pass == 0) F(at) |= VISITED;
                         }
                     }
                 }
             }
             if (pass == 2) {
-                for (int i = 0; i < w*h; ++i) flags[i] &= ~2;
+                for (int i = 0; i < w*h; ++i) F(i) &= ~VISITED;
                 if (style & 32) {
                     uint symbol = 0;
                     for (int i = 0; i < 4; ++i) symbol = (symbol << 1) | decision(&m,src,s.x,18);
