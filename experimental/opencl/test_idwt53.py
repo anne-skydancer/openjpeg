@@ -84,8 +84,8 @@ class OpenCL:
         return data.value.decode(errors="replace")
 
 
-class Reconstruction:
-    def __init__(self, cl, device):
+class KernelProgram:
+    def __init__(self, cl, device, source_bytes, kernel_names):
         self.cl = cl
         self.resources = []
         self.queue = None
@@ -103,7 +103,7 @@ class Reconstruction:
         try:
             self.context = keep(cl.CreateContext(None, 1, ct.byref(dev), None, None, ct.byref(error)), "Context")
             self.queue = keep(cl.CreateCommandQueue(self.context, dev, 0, ct.byref(error)), "CommandQueue")
-            source = ct.c_char_p(Path(__file__).with_name("idwt53.cl").read_bytes())
+            source = ct.c_char_p(source_bytes)
             program = keep(cl.CreateProgramWithSource(self.context, 1, ct.byref(source), None, ct.byref(error)), "Program")
             code = cl.BuildProgram(program, 1, ct.byref(dev), b"-cl-std=CL1.2", None, None)
             if code:
@@ -113,7 +113,7 @@ class Reconstruction:
                 cl.check(cl.GetProgramBuildInfo(program, dev, 0x1183, length, log, None), "build log")
                 raise RuntimeError(f"Kernel build error {code}: {log.value.decode(errors='replace')}")
             self.kernels = [keep(cl.CreateKernel(program, name, ct.byref(error)), "Kernel")
-                            for name in (b"undo_update", b"undo_predict")]
+                            for name in kernel_names]
         except Exception:
             self.close()
             raise
@@ -125,6 +125,12 @@ class Reconstruction:
             getattr(self.cl, "Release" + kind)(value)
         self.resources.clear()
         self.queue = None
+
+
+class Reconstruction(KernelProgram):
+    def __init__(self, cl, device):
+        super().__init__(cl, device, Path(__file__).with_name("idwt53.cl").read_bytes(),
+                         (b"undo_update", b"undo_predict"))
 
     def decode(self, samples, length, lines, sample_stride, line_stride, parity):
         if not (1 <= length <= 4096 and 1 <= lines <= 4096 and parity in (0, 1)):
