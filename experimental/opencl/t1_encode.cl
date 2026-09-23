@@ -74,7 +74,13 @@ void enc_bit(ENCODER *e,uint context,uint bit)
         if(m->a<s.x) m->c+=s.x; else m->a=s.x;
         set_context(m,context,s.w);
     }
-    do { m->a<<=1;m->c<<=1;if(!--m->ct) enc_byteout(e); } while(!(m->a&0x8000));
+    /* Shift directly to the next normalization or byte-output boundary. */
+    uint shifts=clz(m->a)-16;
+    do {
+        uint n=min(shifts,m->ct);
+        m->a<<=n;m->c<<=n;m->ct-=n;shifts-=n;
+        if(!m->ct)enc_byteout(e);
+    } while(shifts);
 }
 void enc_flush(ENCODER *e)
 {
@@ -105,7 +111,7 @@ void enc_sign(ENCODER *e,__local uint *flags,int x,int y,int w,int h,uint sign)
     if(row==3&&y+1<h)flags[stripe+w]|=sign<<18;
 }
 __attribute__((always_inline)) inline int encode_pass(ENCODER *e,
-    __global const int *data,__local uint *flags,int w,int h,uint orient,
+    __global const int *data,__local uint *flags,int w,int h,int stride,uint orient,
     uint pass,int bp)
 {
     uint one=1u<<(bp+6);int nmse=0;
@@ -114,13 +120,13 @@ __attribute__((always_inline)) inline int encode_pass(ENCODER *e,
         for(int x=0;x<w;++x) {
             int start=0,forced=0;
             if(pass==2&&rows==4&&!(flags[(stripe>>2)*w+x]&(0x3ffffu|PI_ALL))) {
-                while(start<4 && !(abs(data[(stripe+start)*w+x])&one))++start;
+                while(start<4 && !(abs(data[(stripe+start)*stride+x])&one))++start;
                 enc_bit(e,17,start<4);
                 if(start==4)continue;
                 enc_bit(e,18,(uint)start>>1);enc_bit(e,18,(uint)start&1);forced=1;
             }
             for(int j=start;j<rows;++j) {
-                int y=stripe+j,at=y*w+x;uint f=sample_flags(flags,x,y,w),mag=abs(data[at]);
+                int y=stripe+j,at=y*stride+x;uint f=sample_flags(flags,x,y,w),mag=abs(data[at]);
                 uint bit=(mag&one)!=0,index=(mag>>bp)&127;
                 if(pass==1) {
                     if((f&(SIG|VISITED))==SIG) {
@@ -144,7 +150,7 @@ __attribute__((always_inline)) inline int encode_pass(ENCODER *e,
     return nmse;
 }
 
-/* Descriptor: width,height,orientation,coefficient offset,output offset,capacity.
+/* Descriptor: width,height,orientation,coefficient offset,output offset,capacity,row stride.
  * Result: numbps,passes,bytes,error, followed by 90 (rate,nmsedec) pairs.
  * Coefficients carry the upstream six fractional distortion bits. */
 __attribute__((reqd_work_group_size(1,1,1)))
@@ -152,14 +158,14 @@ __kernel void encode_blocks(__global const uint *desc,__global const int *coeff,
     __global uchar *output,__global uint *results,__local uint *flags,uint count)
 {
     uint block=get_global_id(0);if(block>=count)return;
-    __global const uint *d=desc+6*block;
-    int w=d[0],h=d[1];uint orient=d[2];
+    __global const uint *d=desc+7*block;
+    int w=d[0],h=d[1],stride=d[6];uint orient=d[2];
     __global const int *data=coeff+d[3];__global uint *result=results+184*block;
     for(uint i=0;i<184;++i)result[i]=0;
     if(w<1||h<1||w>1024||h>1024||w*h>4096||orient>3||d[5]<2){result[3]=1;return;}
     for(int i=0;i<w*((h+3)/4);++i)flags[i]=0;
     uint maximum=0;
-    for(int i=0;i<w*h;++i)maximum=max(maximum,abs(data[i]));
+    for(int i=0;i<w*h;++i)maximum=max(maximum,abs(data[(i/w)*stride+i%w]));
     if(maximum>=0x80000000u){result[3]=2;return;}
     uint numbps=maximum>=64?26-clz(maximum):0;
     result[0]=numbps;if(!numbps)return;
@@ -169,13 +175,13 @@ __kernel void encode_blocks(__global const uint *desc,__global const int *coeff,
     for(int bp=numbps-1;bp>=0;) {
         int nmse=0;
         if(w==64 && h==64) {
-            if(pass==0)nmse=encode_pass(&e,data,flags,64,64,orient,0,bp);
-            else if(pass==1)nmse=encode_pass(&e,data,flags,64,64,orient,1,bp);
-            else nmse=encode_pass(&e,data,flags,64,64,orient,2,bp);
+            if(pass==0)nmse=encode_pass(&e,data,flags,64,64,stride,orient,0,bp);
+            else if(pass==1)nmse=encode_pass(&e,data,flags,64,64,stride,orient,1,bp);
+            else nmse=encode_pass(&e,data,flags,64,64,stride,orient,2,bp);
         } else {
-            if(pass==0)nmse=encode_pass(&e,data,flags,w,h,orient,0,bp);
-            else if(pass==1)nmse=encode_pass(&e,data,flags,w,h,orient,1,bp);
-            else nmse=encode_pass(&e,data,flags,w,h,orient,2,bp);
+            if(pass==0)nmse=encode_pass(&e,data,flags,w,h,stride,orient,0,bp);
+            else if(pass==1)nmse=encode_pass(&e,data,flags,w,h,stride,orient,1,bp);
+            else nmse=encode_pass(&e,data,flags,w,h,stride,orient,2,bp);
         }
         if(pass==2)for(int i=0;i<w*((h+3)/4);++i)flags[i]&=~PI_ALL;
         if(pass==2&&bp==0)enc_flush(&e);

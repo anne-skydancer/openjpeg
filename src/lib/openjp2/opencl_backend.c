@@ -73,7 +73,7 @@ typedef struct {
     unsigned admitted_active;
     OPJ_UINT64 admitted_bytes;
     cl_command_queue queue;
-    cl_kernel kernels[7];
+    cl_kernel kernels[8];
     cl_mem buffers[8];
     size_t capacities[8];
     cl_event events[260];
@@ -82,7 +82,7 @@ typedef struct {
 
 static struct {
     void *library;
-    int attempted, profiling;
+    int attempted, profiling, rounded_divide;
     cl_context context;
     cl_device_id device;
     cl_program program;
@@ -106,7 +106,7 @@ static void destroy_worker(decode_worker *worker)
     unsigned i;
     if(worker->queue) fnFinish(worker->queue);
     release_buffers(worker);
-    for(i=0;i<7;i++) if(worker->kernels[i]) {
+    for(i=0;i<8;i++) if(worker->kernels[i]) {
         fnReleaseKernel(worker->kernels[i]); worker->kernels[i]=NULL;
     }
     if(worker->queue) { fnReleaseCommandQueue(worker->queue); worker->queue=NULL; }
@@ -127,6 +127,7 @@ static OPJ_BOOL initialize(const char *selector, const char *driver, char *warni
     cl_device_id devices[32], selected=NULL;
     cl_uint np=0, nd=0, p, d, matches=0;
     cl_int error;
+    cl_device_fp_config fp=0;
     const char *workers=getenv("OPJ_OPENCL_WORKERS");
     char *end=NULL;
     long count=workers?strtol(workers,&end,10):4;
@@ -164,7 +165,10 @@ static OPJ_BOOL initialize(const char *selector, const char *driver, char *warni
     runtime.device=selected;
     runtime.program=fnCreateProgramWithSource(runtime.context,(cl_uint)(sizeof(opj_cl_sources)/sizeof(opj_cl_sources[0])),(const char**)opj_cl_sources,NULL,&error);
     if (!runtime.program || error) goto fail;
-    error=fnBuildProgram(runtime.program,1,&selected,"-cl-std=CL1.2",NULL,NULL);
+    fnGetDeviceInfo(selected,CL_DEVICE_SINGLE_FP_CONFIG,sizeof(fp),&fp,NULL);
+    runtime.rounded_divide=(fp&CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT)!=0;
+    error=fnBuildProgram(runtime.program,1,&selected,runtime.rounded_divide?
+        "-cl-std=CL1.2 -cl-fp32-correctly-rounded-divide-sqrt":"-cl-std=CL1.2",NULL,NULL);
     if (error) {
         char log[8192]={0};
         fnGetProgramBuildInfo(runtime.program,selected,CL_PROGRAM_BUILD_LOG,sizeof(log)-1,log,NULL);
@@ -194,15 +198,16 @@ fail:
 
 /* Admission is the only serialized part. Waiting releases the lock; a job
  * never holds it while uploading, decoding, reading back or invoking callbacks.
- * Idle capacity may be reclaimed, but active buffers are never touched. */
+ * Idle capacity may be reclaimed, but active buffers are never touched. A fused
+ * encoder can decline admission without waiting and retry the smaller stages. */
 static decode_worker *acquire_worker(const char *selector,const char *driver,
-                                     const size_t sizes[8],opj_event_mgr_t *manager)
+                                     const size_t sizes[8],opj_event_mgr_t *manager,OPJ_BOOL wait_for_slot)
 {
     decode_worker *worker=NULL;
     char warning[8448]={0};
     unsigned i,j;
     cl_int error;
-    const char *names[7]={"decode_blocks","place_blocks","inverse_line","finish_pixels","encode_blocks","prepare_encode","forward_line"};
+    const char *names[8]={"decode_blocks","place_blocks","inverse_line","finish_pixels","encode_blocks","prepare_encode","forward_line","pack_encode"};
     LOCK();
     if(!initialize(selector,driver,warning,sizeof(warning))) goto fail;
     for(;;) {
@@ -228,13 +233,13 @@ static decode_worker *acquire_worker(const char *selector,const char *driver,
             }
             if(capacity<=BUDGET) break;
         }
-        if(!WAIT()) { worker=NULL; goto fail; }
+        if(!wait_for_slot || !WAIT()) { worker=NULL; goto fail; }
     }
     if(!worker->queue) {
         worker->queue=fnCreateCommandQueue(runtime.context,runtime.device,
                             runtime.profiling?CL_QUEUE_PROFILING_ENABLE:0,&error);
         if(!worker->queue || error) goto fail;
-        for(i=0;i<7;i++) {
+        for(i=0;i<8;i++) {
             worker->kernels[i]=fnCreateKernel(runtime.program,names[i],&error);
             if(!worker->kernels[i] || error) goto fail;
         }
@@ -369,14 +374,14 @@ static int arg(cl_kernel k,cl_uint index,size_t size,const void *value)
 static int run(decode_worker *worker,cl_kernel k,size_t count)
 {
     cl_event event=NULL;
-    size_t local=(k==worker->kernels[1] || k==worker->kernels[2] || k==worker->kernels[6])?64:1;
+    size_t local=(k==worker->kernels[1] || k==worker->kernels[2] || k==worker->kernels[6] || k==worker->kernels[7])?64:1;
     if(local==64) count*=64;
     unsigned i;
     if(!count) return 1;
     if(fnEnqueueNDRangeKernel(worker->queue,k,1,NULL,&count,(k!=worker->kernels[3] && k!=worker->kernels[5])?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
     if(event) {
         if(worker->event_count>=260) { fnReleaseEvent(event); return 0; }
-        for(i=0;i<7;i++) if(k==worker->kernels[i]) break;
+        for(i=0;i<8;i++) if(k==worker->kernels[i]) break;
         worker->stages[worker->event_count]=i;
         worker->events[worker->event_count++]=event;
     }
@@ -437,7 +442,7 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     sizes[7]=(size_t)total*4;
     budget=0;for(i=0;i<8;i++) budget+=sizes[i];
     if(budget>BUDGET) goto cleanup;
-    worker=acquire_worker(selector,driver,sizes,manager);
+    worker=acquire_worker(selector,driver,sizes,manager,OPJ_TRUE);
     if(!worker) goto cleanup;
     p.desc=(OPJ_UINT32*)opj_malloc(sizes[0]);p.segs=(OPJ_UINT32*)opj_calloc(1,sizes[1]);
     p.input=(OPJ_BYTE*)opj_calloc(1,sizes[2]);p.status=(OPJ_UINT32*)opj_malloc(sizes[4]);
@@ -547,12 +552,15 @@ static OPJ_FLOAT64 encode_distortion(OPJ_INT32 nmse,const encode_ref *ref,
     return value;
 }
 
-OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
+static OPJ_BOOL encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager,decode_worker *external);
+
+static OPJ_BOOL encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager,OPJ_BOOL fused)
 {
     const char *selector=getenv("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
     opj_tcd_tile_t *tile=tcd->tcd_image->tiles;
     OPJ_UINT32 n=0,samples=0,bytes=0,max_flags=0,c,r,b,pr,k,i,pass;
-    OPJ_UINT32 *desc=NULL,*results=NULL;
+    OPJ_UINT32 *desc=NULL,*results=NULL,*map=NULL;
+    OPJ_UINT64 plane_samples=0;
     OPJ_INT32 *coeff=NULL;
     OPJ_BYTE *output=NULL;
     encode_ref *refs=NULL;
@@ -562,7 +570,7 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     decode_worker *worker=NULL;
     OPJ_BOOL success=OPJ_FALSE;
     unsigned slot=0,active=0;OPJ_UINT64 pooled=0;
-    double device_ms=0;
+    double device_ms=0,stage_ms[8]={0};
     cl_kernel kernel;
     if(!selector||!*selector||tile->numcomps<1||tile->numcomps>4)return OPJ_FALSE;
     if(!driver)driver="";
@@ -574,7 +582,7 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
         norms=tcd->tcp->tccps[0].qmfbid?opj_mct_get_mct_norms():opj_mct_get_mct_norms_real();
     } else {norm_count=tcd->image->numcomps;norms=(const OPJ_FLOAT64*)tcd->tcp->mct_norms;}
     for(pass=0;pass<2;pass++) {
-        n=0;samples=0;bytes=0;max_flags=0;
+        n=0;samples=0;bytes=0;max_flags=0;plane_samples=0;
         for(c=0;c<tile->numcomps;c++) {
             opj_tcd_tilecomp_t *tc=&tile->comps[c];
             opj_tccp_t *cc=&tcd->tcp->tccps[c];
@@ -603,11 +611,17 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
                             if(band->bandno&2)y+=tc->resolutions[r-1].y1-tc->resolutions[r-1].y0;
                             if(x<0||y<0||(OPJ_UINT32)(x+w)>stride||(OPJ_UINT32)(y+h)>height)goto cleanup;
                             if(pass) {
-                                OPJ_UINT32 *d=desc+6*n;
-                                d[0]=w;d[1]=h;d[2]=band->bandno;d[3]=samples;d[4]=bytes;d[5]=capacity;
+                                OPJ_UINT32 *d=desc+7*n;
+                                d[0]=w;d[1]=h;d[2]=band->bandno;d[3]=samples;d[4]=bytes;d[5]=capacity;d[6]=w;
                                 refs[n].block=block;refs[n].comp=c;refs[n].level=tc->numresolutions-1-r;
                                 refs[n].orient=band->bandno;refs[n].reversible=cc->qmfbid;refs[n].stepsize=band->stepsize;
-                                for(j=0;j<(OPJ_UINT32)(w*h);j++) {
+                                if(fused) {
+                                    map[4*n]=(OPJ_UINT32)plane_samples+y*stride+x;
+                                    d[3]=map[4*n];d[6]=stride;
+                                    map[4*n+1]=stride;map[4*n+2]=cc->qmfbid;
+                                    memcpy(map+4*n+3,&band->stepsize,4);
+                                }
+                                for(j=0;!fused && j<(OPJ_UINT32)(w*h);j++) {
                                     OPJ_UINT32 at=(y+j/w)*stride+x+j%w;
                                     if(cc->qmfbid) {
                                         OPJ_INT32 v=tc->data[at];
@@ -626,22 +640,38 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
                     }
                 }
             }
+            plane_samples+=(OPJ_UINT64)stride*height;
         }
         if(!pass) {
-            OPJ_UINT64 budget=(OPJ_UINT64)n*(6+184)*4+(OPJ_UINT64)samples*4+bytes;
+            OPJ_UINT64 budget=(OPJ_UINT64)n*(7+184)*4+(fused?0:(OPJ_UINT64)samples*4)+bytes;
+            if(fused)budget+=plane_samples*4+(OPJ_UINT64)n*16;
             if(!n||budget>BUDGET)goto cleanup;
-            sizes[0]=(size_t)n*6*4;sizes[1]=(size_t)samples*4;sizes[2]=bytes;sizes[3]=(size_t)n*184*4;
-            desc=(OPJ_UINT32*)opj_malloc(sizes[0]);coeff=(OPJ_INT32*)opj_malloc(sizes[1]);
+            if(fused){sizes[4]=(size_t)n*16;sizes[7]=(size_t)plane_samples*4;}
+            sizes[0]=(size_t)n*7*4;sizes[1]=fused?0:(size_t)samples*4;sizes[2]=bytes;sizes[3]=(size_t)n*184*4;
+            desc=(OPJ_UINT32*)opj_malloc(sizes[0]);
+            if(fused)map=(OPJ_UINT32*)opj_malloc(sizes[4]);
+            else coeff=(OPJ_INT32*)opj_malloc(sizes[1]);
             output=(OPJ_BYTE*)opj_malloc(sizes[2]);results=(OPJ_UINT32*)opj_malloc(sizes[3]);
             refs=(encode_ref*)opj_calloc(n,sizeof(encode_ref));
-            if(!desc||!coeff||!output||!results||!refs)goto cleanup;
+            if(!desc||(!fused&&!coeff)||(fused&&!map)||!output||!results||!refs)goto cleanup;
         }
     }
-    worker=acquire_worker(selector,driver,sizes,manager);if(!worker)goto cleanup;
-    if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[0],CL_FALSE,0,sizes[0],desc,0,NULL,NULL)||
-       fnEnqueueWriteBuffer(worker->queue,worker->buffers[1],CL_FALSE,0,sizes[1],coeff,0,NULL,NULL))goto cleanup;
+    worker=acquire_worker(selector,driver,sizes,manager,!fused);if(!worker)goto cleanup;
+    if(fused) {
+        for(c=0;c<tile->numcomps;c++)
+            if(!tcd->tcp->tccps[c].qmfbid && !runtime.rounded_divide)goto cleanup;
+        if(!encode_transform(tcd,manager,worker))goto cleanup;
+    }
+    if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[0],CL_FALSE,0,sizes[0],desc,0,NULL,NULL))goto cleanup;
+    if(fused) {
+        if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[4],CL_FALSE,0,sizes[4],map,0,NULL,NULL))goto cleanup;
+        kernel=worker->kernels[7];
+        ARG(kernel,0,worker->buffers[0]);ARG(kernel,1,worker->buffers[4]);
+        ARG(kernel,2,worker->buffers[7]);ARG(kernel,3,worker->buffers[7]);ARG(kernel,4,n);
+        if(!run(worker,kernel,n))goto cleanup;
+    } else if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[1],CL_FALSE,0,sizes[1],coeff,0,NULL,NULL))goto cleanup;
     kernel=worker->kernels[4];
-    for(i=0;i<4;i++){ARG(kernel,i,worker->buffers[i]);}
+    for(i=0;i<4;i++){cl_mem buffer=(fused && i==1)?worker->buffers[7]:worker->buffers[i];ARG(kernel,i,buffer);}
     if(!arg(kernel,4,max_flags,NULL))goto cleanup;
     ARG(kernel,5,n);if(!run(worker,kernel,n))goto cleanup;
     if(fnEnqueueReadBuffer(worker->queue,worker->buffers[2],CL_FALSE,0,sizes[2],output,0,NULL,NULL)||
@@ -649,7 +679,7 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     /* Validate all metadata before changing any CPU block or distortion total. */
     for(i=0;i<n;i++) {
         OPJ_UINT32 *v=results+184*i,previous=0;
-        if(v[3]||v[0]>25||v[1]!=(v[0]?3*v[0]-2:0)||v[2]>=desc[6*i+5])goto cleanup;
+        if(v[3]||v[0]>25||v[1]!=(v[0]?3*v[0]-2:0)||v[2]>=desc[7*i+5])goto cleanup;
         for(k=0;k<v[1];k++) {
             OPJ_UINT32 rate=v[4+2*k];
             if(rate<previous||rate>v[2])goto cleanup;
@@ -663,7 +693,7 @@ OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
         OPJ_FLOAT64 cumulative=0;
         opj_tcd_cblk_enc_t *block=refs[i].block;
         block->numbps=v[0];block->totalpasses=v[1];
-        memcpy(block->data,output+desc[6*i+4]+1,v[2]);
+        memcpy(block->data,output+desc[7*i+4]+1,v[2]);
         for(k=0;k<v[1];k++) {
             opj_tcd_pass_t *p=&block->passes[k];
             p->rate=v[4+2*k];p->len=p->rate-previous;previous=p->rate;p->term=(k+1==v[1]);
@@ -679,21 +709,29 @@ cleanup:
         for(i=0;i<worker->event_count;i++) {
             cl_ulong start=0,end=0;
             if(fnGetEventProfilingInfo(worker->events[i],CL_PROFILING_COMMAND_START,sizeof(start),&start,NULL)==CL_SUCCESS &&
-               fnGetEventProfilingInfo(worker->events[i],CL_PROFILING_COMMAND_END,sizeof(end),&end,NULL)==CL_SUCCESS)
-                device_ms+=(end-start)/1000000.0;
+               fnGetEventProfilingInfo(worker->events[i],CL_PROFILING_COMMAND_END,sizeof(end),&end,NULL)==CL_SUCCESS) {
+                double ms=(end-start)/1000000.0;device_ms+=ms;
+                if(worker->stages[i]<8)stage_ms[worker->stages[i]]+=ms;
+            }
             fnReleaseEvent(worker->events[i]);
         }
         worker->event_count=0;slot=(unsigned)(worker-runtime.workers);
         active=worker->admitted_active;pooled=worker->admitted_bytes;release_worker(worker,success);
     }
+    if(success && fused) {
+        opj_event_msg(manager,EVT_INFO,"OpenCL forward transformed tile %u worker %u active %u pooled %llu\n",tcd->tcd_tileno,slot,active,(unsigned long long)pooled);
+        opj_event_msg(manager,EVT_INFO,"OpenCL fused encoding tile %u\n",tcd->tcd_tileno);
+    }
     if(success)opj_event_msg(manager,EVT_INFO,"OpenCL encoded Tier-1 tile %u (%u blocks) worker %u active %u pooled %llu\n",tcd->tcd_tileno,n,slot,active,(unsigned long long)pooled);
-    if(success && runtime.profiling)opj_event_msg(manager,EVT_INFO,"OpenCL encode Tier-1 device %.3f ms\n",device_ms);
-    opj_free(desc);opj_free(coeff);opj_free(output);opj_free(results);opj_free(refs);
+    if(success && runtime.profiling)opj_event_msg(manager,EVT_INFO,
+        "OpenCL encode device %.3f ms: transform %.3f pack %.3f entropy %.3f\n",
+        device_ms,stage_ms[5]+stage_ms[6],stage_ms[7],stage_ms[4]);
+    opj_free(map);opj_free(desc);opj_free(coeff);opj_free(output);opj_free(results);opj_free(refs);
     return success;
 }
 
 
-OPJ_BOOL opj_opencl_encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager)
+static OPJ_BOOL encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager,decode_worker *external)
 {
     const char *selector=getenv("OPJ_OPENCL_ENCODE_DEVICE"),*driver=getenv("OPJ_OPENCL_DRIVER");
     opj_tcd_tile_t *tile=tcd->tcd_image->tiles;
@@ -738,8 +776,9 @@ OPJ_BOOL opj_opencl_encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager)
             planes[c*samples+i]=v;
         }
     }
-    worker=acquire_worker(selector,driver,sizes,manager);if(!worker)goto cleanup;
-    if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[7],CL_FALSE,0,sizes[7],planes,0,NULL,NULL))goto cleanup;
+    worker=external?external:acquire_worker(selector,driver,sizes,manager,OPJ_TRUE);if(!worker)goto cleanup;
+    if(worker->capacities[7]<sizes[7])goto cleanup;
+    if(fnEnqueueWriteBuffer(worker->queue,worker->buffers[7],CL_TRUE,0,sizes[7],planes,0,NULL,NULL))goto cleanup;
     kernel=worker->kernels[5];
     ARG(kernel,0,worker->buffers[7]);ARG(kernel,1,samples);ARG(kernel,2,components);
     ARG(kernel,3,mct);ARG(kernel,4,rev);ARG(kernel,5,shift);
@@ -759,11 +798,12 @@ OPJ_BOOL opj_opencl_encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager)
             if(!run(worker,kernel,rh))goto cleanup;
         }
     }
+    if(external){success=OPJ_TRUE;goto cleanup;}
     if(fnEnqueueReadBuffer(worker->queue,worker->buffers[7],CL_TRUE,0,sizes[7],planes,0,NULL,NULL))goto cleanup;
     for(c=0;c<components;c++)memcpy(tile->comps[c].data,planes+c*samples,(size_t)samples*4);
     success=OPJ_TRUE;
 cleanup:
-    if(worker) {
+    if(worker && !external) {
         fnFinish(worker->queue);
         for(i=0;i<worker->event_count;i++) {
             cl_ulong start=0,end=0;
@@ -775,7 +815,27 @@ cleanup:
         worker->event_count=0;slot=(unsigned)(worker-runtime.workers);
         active=worker->admitted_active;pooled=worker->admitted_bytes;release_worker(worker,success);
     }
-    if(success)opj_event_msg(manager,EVT_INFO,"OpenCL forward transformed tile %u worker %u active %u pooled %llu\n",tcd->tcd_tileno,slot,active,(unsigned long long)pooled);
-    if(success && runtime.profiling)opj_event_msg(manager,EVT_INFO,"OpenCL encode transforms device %.3f ms\n",device_ms);
+    if(success && !external)opj_event_msg(manager,EVT_INFO,"OpenCL forward transformed tile %u worker %u active %u pooled %llu\n",tcd->tcd_tileno,slot,active,(unsigned long long)pooled);
+    if(success && !external && runtime.profiling)opj_event_msg(manager,EVT_INFO,"OpenCL encode transforms device %.3f ms\n",device_ms);
     opj_free(planes);return success;
+}
+
+OPJ_BOOL opj_opencl_encode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
+{
+    const char *workers=getenv("OPJ_OPENCL_WORKERS");
+    /* Larger pools favor overlap between the smaller stages. Fusion reduced
+     * eight-worker lossy throughput in paired measurements under the 64 MiB cap.
+     * Keep fusion for the default four-slot pool and smaller latency workloads. */
+    if(workers && strtol(workers,NULL,10)>4)return OPJ_FALSE;
+    return encode_tier1(tcd,manager,OPJ_TRUE);
+}
+
+OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd,opj_event_mgr_t *manager)
+{
+    return encode_tier1(tcd,manager,OPJ_FALSE);
+}
+
+OPJ_BOOL opj_opencl_encode_transform(opj_tcd_t *tcd,opj_event_mgr_t *manager)
+{
+    return encode_transform(tcd,manager,NULL);
 }

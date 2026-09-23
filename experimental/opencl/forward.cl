@@ -105,3 +105,27 @@ __kernel void forward_line(__global int *planes,__local int *tmp,
         planes[origin+target*step]=tmp[i];
     }
 }
+
+/* One cooperative group gathers and quantizes a complete code block. Correctly
+ * rounded division plus round-to-even matches upstream float division/lrintf.
+ * The source and destination alias safely: code blocks partition the planes,
+ * and each work-item reads/writes its own unique sample.
+ * INT_MIN is the entropy kernel rejection sentinel; no CPU state is modified. */
+__attribute__((reqd_work_group_size(64,1,1)))
+__kernel void pack_encode(__global const uint *desc,__global const uint *map,
+    __global const int *planes,__global int *coeff,uint count)
+{
+    uint block=get_group_id(0);if(block>=count)return;
+    __global const uint *d=desc+7*block,*m=map+4*block;
+    uint w=d[0],h=d[1];
+    for(uint i=get_local_id(0);i<w*h;i+=64) {
+        int v=planes[m[0]+(i/w)*m[1]+i%w],out=(int)0x80000000u;
+        if(m[2]) {
+            if(v>-33554432 && v<33554432)out=as_int(as_uint(v)<<6);
+        } else {
+            float q=(as_float(v)/as_float(m[3]))*64.0f;
+            if(q>-2147483000.0f && q<2147483000.0f)out=convert_int_rte(q);
+        }
+        coeff[d[3]+(i/w)*d[6]+i%w]=out;
+    }
+}

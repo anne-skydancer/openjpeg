@@ -381,8 +381,8 @@ embedded bundle. No Roger or xxjjss decoder code is copied.
 
 The optional encoder accelerates level shifting, reversible/irreversible color
 transforms, forward 5/3 or 9/7 wavelets, and style-zero Tier-1 MQ entropy coding.
-Quantization, distortion weighting, rate allocation and Tier-2 packet assembly
-remain on the CPU. Both lossy and lossless encoding use the existing OpenJPEG
+Eligible tiles also perform quantization and coefficient packing on the GPU.
+Distortion weighting, rate allocation and Tier-2 packet assembly remain on the CPU. Both lossy and lossless encoding use the existing OpenJPEG
 API. Unsupported configurations or failed GPU stages use the original CPU stage;
 results are committed only after the entire GPU stage succeeds.
 
@@ -400,8 +400,19 @@ buffer limit. Driver allocations, kernels and CPU staging are additional.
 The transform path supports matching component geometry, 1-4 components,
 1-16-bit samples and dimensions up to 4096, subject to the buffer limit.
 Tier-1 currently requires coding style zero without ROI; other styles retain
-CPU entropy coding even when GPU transforms are eligible. Intermediate CPU
-quantization currently requires a device readback and another upload.
+CPU entropy coding even when GPU transforms are eligible. The fused path keeps
+transformed planes on the device under one worker lease and quantizes them in
+place. Only encoded blocks and rate-allocation metadata return to the CPU.
+Lossy GPU quantization requires correctly rounded single-precision division;
+devices without that capability use the existing staged path. If the combined
+buffers exceed 64 MiB, separate stages or CPU encoding remain available. Fused
+admission is nonblocking: concurrent jobs that cannot immediately acquire the
+larger working set retry the smaller stages, allowing more jobs to overlap
+without waiting for fused buffers. This also means concurrent runs may mix fused
+and staged GPU tiles; `gpu_fused_tiles` reports that distinction. Pools configured
+above four slots deliberately retain staged GPU encoding: the fused route
+regressed eight-worker lossy throughput by 11% in the qualification sweep. The
+default stays four slots.
 
 `bench_encode` reuses the concurrent benchmark harness. It decodes input J2K
 files once before timing, then measures image cloning, encoder setup, encoding,
@@ -410,7 +421,7 @@ arguments for an 8:1 target; otherwise encoding is lossless. Its
 `--write-reference DIRECTORY` and `--verify-reference DIRECTORY` options compare
 complete encoded codestream bytes. Reference directories must already exist.
 
-Repeated RelWithDebInfo results on RX 9070 XT / gfx1201, driver 3679, used 32
+Initial, pre-fusion RelWithDebInfo results on RX 9070 XT / gfx1201, driver 3679, used 32
 private cached textures, three trials and five warm rounds per trial: 480
 measured encodes per configuration, excluding warmup. The middle trial reversed
 execution order. All output checksums agreed, and both GPU stage counts matched
@@ -429,10 +440,11 @@ but multithreaded CPU encoding remains faster. These are current desktop
 measurements, not a controlled viewer-rendering-load qualification or a viewer
 FPS claim. Keep GPU encoding opt-in while reducing transfers and entropy cost.
 
-The encoder regression matrix requires byte-identical codestreams for 123 GPU
-cases and two fallback controls, including odd/tiled origins, short dimensions,
+The current encoder regression matrix requires byte-identical codestreams for
+135 fused GPU cases and three fallback controls, including odd/tiled origins, short dimensions,
 8/16-bit signed/unsigned samples, 1/3/4 components, multiple rate layers and
-constant images. Concurrent exact-output tests exercise eight callers with
+constant images, nonstandard block shapes and a combined-buffer budget refusal.
+Concurrent exact-output tests exercise eight callers with
 1/2/4/8 GPU slots and the shared buffer cap. Hardware qualification is currently
 limited to this AMD device/driver.
 
@@ -443,3 +455,58 @@ The CPU-only Release library also builds. The existing `build/gpu-release`
 decoder DLL was preserved unchanged. Release uses /O2, /Ob3 and link-time
 optimization with precise floating-point semantics; the performance table above
 remains the measured RelWithDebInfo result rather than an inferred Release gain.
+
+## Encoder optimization results (2026-09-23)
+
+Implemented the [optimization plan](ENCODER_OPTIMIZATION.md): device-resident
+transforms and in-place quantization, larger MQ renormalization shifts, and
+memory-aware admission. The encoded stream remains CPU-byte-identical.
+
+These paired optimized Release results compare against `34974482`. Each table
+cell uses three trials of 32 cached textures and three warm rounds (288 measured
+encodes plus warmups), with the middle trial reversing order. Parentheses show
+the range of process means. The eight-worker row is a subsequent paired rerun
+after selecting the staged policy; it should be compared within its row, not
+used to estimate scaling against earlier rows. No other correctness tests ran
+alongside the benchmark. Desktop/rendering load was not controlled.
+
+| Image workers | Previous lossless/s | New lossless/s | Previous lossy/s | New lossy/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 34.21 (33.87-34.59) | 46.33 (38.45-50.89) | 31.19 (30.39-31.75) | 44.84 (43.77-45.74) |
+| 2 | 55.80 (54.80-56.42) | 63.44 (63.12-63.97) | 54.02 (53.57-54.84) | 59.58 (58.41-61.80) |
+| 4 | 83.60 (73.65-92.89) | 81.69 (74.86-90.81) | 78.15 (72.91-84.38) | 78.29 (67.43-93.55) |
+| 8 | 118.00 (114.31-119.96) | 106.72 (81.66-119.62) | 112.01 (109.04-115.50) | 99.87 (76.47-113.14) |
+
+One-worker mean throughput improved **35% losslessly and 44% lossily**; two-worker
+gains were **14% and 10%**. Four-worker throughput was roughly unchanged. The
+eight-worker staged rerun was variable and still **10%/11% slower on average**;
+no high-concurrency speedup is claimed. Preserving the smaller staged route did
+not establish that all throughput regressions are solved. The default remains
+four slots, and encoding remains opt-in.
+
+CPU encoding remains competitive: the main sweep measured 71.51/77.26 textures/s
+with four CPU threads inside one image, and 82.75/105.87 with four independent
+single-threaded image jobs (lossless/lossy). This is not a universal GPU win or
+a claim about viewer FPS or upload latency.
+
+Separate device profiling of a deterministic random 1024x1024 RGB image measured
+23.363 ms losslessly (transform 0.317, quantization 0.029, entropy 23.017) and
+20.270 ms lossily (0.347, 0.036, 19.887). Entropy is about 98% of device time in
+that sample. Transfer, host processing and rate allocation are outside these
+device-event totals.
+
+Validation: the full eight-test Release suite and all 29,184 decoder reference
+blocks passed. Encoder tests were repeated after the final scheduling policy:
+135 fused cases plus three fallbacks, and concurrent exact comparisons at
+1/2/4/8 slots. A further **512 real-cache GPU encodes** (both compression modes,
+eight callers at each slot count) matched CPU codestream bytes exactly. Shared
+device-buffer accounting remained within 64 MiB. Release and RelWithDebInfo DLLs
+were rebuilt; the CPU-only Release library builds. The deployed decoder DLL was
+not replaced.
+
+Reproduce the paired sweep with `compare_encode.py --baseline PATH_TO_OLD_BENCH
+--candidate PATH_TO_NEW_BENCH --device gfx1201 --driver 3679 --output RESULTS.json
+INPUTS...` (on one command line). It records corpus and executable/library hashes,
+checks all output checksums, requires full GPU-stage execution, and records
+fused/staged counts. Private inputs and raw local measurements remain in ignored
+`build/`.

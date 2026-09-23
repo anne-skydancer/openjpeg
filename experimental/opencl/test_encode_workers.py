@@ -51,6 +51,8 @@ def main():
             gpu["OPJ_OPENCL_DEVICE"]=args.device
         actual = run("--verify-reference", gpu, 8)
         assert actual["checksums"] == expected["checksums"], actual
+        if slots<=4:assert 0 < actual["gpu_fused_tiles"] <= actual["tiles"],actual
+        else:assert actual["gpu_fused_tiles"]==0,actual
         assert actual["gpu_tiles"] == actual["gpu_transform_tiles"] == actual["tiles"] == 3*len(sources), actual
         assert 0 < actual["peak_pool_bytes"] <= 64*1024*1024, actual
         assert 1 <= actual["peak_active"] <= slots, actual

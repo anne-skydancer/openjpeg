@@ -36,3 +36,22 @@ cmake --build build/gpu --config RelWithDebInfo --parallel 8
 Substitute `mq-lookahead.patch` for the second experiment. The patches are tied to
 this source revision; `git apply --check` should fail if future changes conflict.
 The runtime remains opt-in and no viewer package is changed by these experiments.
+
+## Encoder coefficient cache
+
+An intermediate experiment staged coefficients once in work-group local memory
+rather than reading device memory throughout entropy passes. All 135 fused cases
+and three fallback controls were byte-exact, but screening was slower. It was
+removed before the subsequent in-place quantization change.
+
+| Mode | Workers | Retained textures/s | Local cache textures/s |
+| --- | ---: | ---: | ---: |
+| Lossless | 1 | 50.03 | 43.16 |
+| Lossless | 4 | 79.38 | 57.06 |
+| Lossy 8:1 | 1 | 43.69 | 43.08 |
+| Lossy 8:1 | 4 | 75.55 | 65.09 |
+
+This was a single screening trial of 32 textures, three warm rounds. It is
+sufficient to reject this candidate, not a precise estimate of its penalty.
+The measurements apply to the intermediate two-buffer fused encoder; they do
+not establish the performance of a different cache layout for the final path.

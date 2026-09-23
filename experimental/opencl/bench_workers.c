@@ -27,7 +27,7 @@ typedef struct {
     const char *path;
 #ifdef OPJ_BENCH_ENCODING
     opj_image_t *source;
-    unsigned transformed;
+    unsigned transformed, fused;
 #endif
     unsigned gpu_tiles, cpu_tiles, worker_mask, peak_active;
     unsigned long long peak_pool_bytes;
@@ -46,6 +46,7 @@ static void info(const char *message,void *data)
 #ifdef OPJ_BENCH_ENCODING
     {
         unsigned slot,active;unsigned long long bytes;int count=0;
+        if(strstr(message,"OpenCL fused encoding tile"))++job->fused;
         if(strstr(message,"OpenCL encoded Tier-1 tile")) {
             ++job->gpu_tiles;
             count=sscanf(message,"OpenCL encoded Tier-1 tile %*u (%*u blocks) worker %u active %u pooled %llu",&slot,&active,&bytes);
@@ -178,7 +179,7 @@ static void encode_job(int index)
     job_result *job=&jobs[index];opj_cparameters_t p;unsigned c,min_length=~0u;
     opj_image_t *image=copy_source(job->source);opj_codec_t *codec=NULL;opj_stream_t *stream=NULL;
     sink output={0};size_t i;
-    job->transformed=0;
+    job->transformed=job->fused=0;
     job->gpu_tiles=job->cpu_tiles=job->worker_mask=job->peak_active=0;
     job->checksum=job->peak_pool_bytes=0;job->ok=0;
     if(!image)goto done;
@@ -277,7 +278,7 @@ int main(int argc,char **argv)
     int workers,repeat,round,i,created;
     unsigned gpu_tiles=0,tiles=0,worker_mask=0,peak_active=0;
 #ifdef OPJ_BENCH_ENCODING
-    unsigned transformed=0;
+    unsigned transformed=0,fused=0;
 #endif
     unsigned long long peak_pool_bytes=0;
     unsigned long long *expected=NULL;
@@ -342,7 +343,7 @@ int main(int argc,char **argv)
             expected[i]=jobs[i].checksum;
             gpu_tiles+=jobs[i].gpu_tiles; tiles+=jobs[i].cpu_tiles;
 #ifdef OPJ_BENCH_ENCODING
-            transformed+=jobs[i].transformed;
+            transformed+=jobs[i].transformed;fused+=jobs[i].fused;
 #endif
             worker_mask|=jobs[i].worker_mask;
             if(jobs[i].peak_active>peak_active) peak_active=jobs[i].peak_active;
@@ -354,7 +355,7 @@ int main(int argc,char **argv)
     for(i=0;i<job_count;i++) printf("%s\"%llu\"",i?",":"",expected[i]);
     printf("],\"worker_mask\":%u,\"peak_active\":%u,\"peak_pool_bytes\":%llu",worker_mask,peak_active,peak_pool_bytes);
 #ifdef OPJ_BENCH_ENCODING
-    printf(",\"gpu_transform_tiles\":%u,\"encoding\":true",transformed);
+    printf(",\"gpu_transform_tiles\":%u,\"gpu_fused_tiles\":%u,\"encoding\":true",transformed,fused);
 #endif
     puts("}");
     fflush(stdout);

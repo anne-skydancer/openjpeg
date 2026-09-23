@@ -27,7 +27,7 @@ def main():
     root=Path(tempfile.mkdtemp(prefix="run-",dir=args.out)).resolve()
     binary=args.bin.resolve()/("opj_compress.exe" if os.name=="nt" else "opj_compress")
     cpu=os.environ.copy()
-    for key in ("OPJ_OPENCL_DEVICE","OPJ_OPENCL_ENCODE_DEVICE","OPJ_OPENCL_DRIVER","OPJ_OPENCL_PROFILE","OPJ_T1_CAPTURE_FILE"):
+    for key in ("OPJ_OPENCL_DEVICE","OPJ_OPENCL_ENCODE_DEVICE","OPJ_OPENCL_DRIVER","OPJ_OPENCL_WORKERS","OPJ_OPENCL_PROFILE","OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key,None)
     gpu=dict(cpu,OPJ_OPENCL_ENCODE_DEVICE=args.device,OPJ_OPENCL_DRIVER=args.driver)
     rng=random.Random(2392026)
@@ -48,7 +48,8 @@ def main():
                         dest=root/(name+"-"+label+".j2k")
                         logs.append(run(common+["-o",dest],env));data.append(dest.read_bytes())
                     (root/(name+".log")).write_text("\n".join(logs))
-                    if ("OpenCL encoded Tier-1 tile" not in logs[1] or
+                    if ("OpenCL fused encoding tile" not in logs[1] or
+                            "OpenCL encoded Tier-1 tile" not in logs[1] or
                             logs[1].count("OpenCL forward transformed tile") != logs[1].count("OpenCL encoded Tier-1 tile")):
                         raise AssertionError(f"GPU encoder did not run: {name}\n{logs[1]}")
                     if data[0]!=data[1]:
@@ -72,7 +73,7 @@ def main():
                     dest=root/f"wide-{int(signed)}-{channels}-{int(irreversible)}-{label}.j2k"
                     log=run(common+["-o",dest],env)
                     if label=="gpu":
-                        assert "OpenCL forward transformed tile" in log and "OpenCL encoded Tier-1 tile" in log,log
+                        assert "OpenCL fused encoding tile" in log and "OpenCL forward transformed tile" in log and "OpenCL encoded Tier-1 tile" in log,log
                     outputs.append(dest.read_bytes())
                 assert outputs[0]==outputs[1],(signed,channels,irreversible)
                 count+=1
@@ -86,6 +87,30 @@ def main():
             if label=="gpu":assert "OpenCL encoded Tier-1 tile" in log,log
         assert outputs[0]==outputs[1]
         count+=1
+    # Non-default block shapes stress packed stripes and coefficient gathering.
+    raw=root/"shapes.raw";raw.write_bytes(bytes(rng.randrange(256) for _ in range(137*139*3)))
+    for shape in ("16,16","32,128","128,32","4,1024","1024,4","32,32"):
+        for irreversible in (False,True):
+            common=[binary,"-i",raw,"-F","137,139,3,8,u","-n",4,"-b",shape,"-r","16,8,1","-threads",1]
+            if irreversible:common.append("-I")
+            outputs=[]
+            for label,env in (("cpu",cpu),("gpu",gpu)):
+                dest=root/f"shape-{shape}-{irreversible}-{label}.j2k"
+                log=run(common+["-o",dest],env);outputs.append(dest.read_bytes())
+                if label=="gpu":assert "OpenCL fused encoding tile" in log,log
+            assert outputs[0]==outputs[1],(shape,irreversible)
+            count+=1
+    # The complete pipeline exceeds 64 MiB. Separate stages/CPU must still
+    # produce the exact codestream without keeping a worker lease or partial state.
+    raw=root/"budget.raw";raw.write_bytes(bytes(range(256))*(2048*2048*3//256))
+    outputs=[]
+    common=[binary,"-i",raw,"-F","2048,2048,3,8,u","-n",5,"-threads",1]
+    for label,env in (("cpu",cpu),("gpu",gpu)):
+        dest=root/f"budget-{label}.j2k"
+        log=run(common+["-o",dest],env);outputs.append(dest.read_bytes())
+        if label=="gpu":assert "OpenCL fused encoding tile" not in log,log
+    assert outputs[0]==outputs[1]
+    count+=1
     raw=root/"fallback.raw";raw.write_bytes(bytes(rng.randrange(256) for _ in range(33*35)))
     for style,device,expected_transform in ((63,args.device,True),(0,"no-such-OpenCL-device",False)):
         common=[binary,"-i",raw,"-F","33,35,1,8,u","-n",3,"-M",style,"-threads",1]
@@ -98,7 +123,7 @@ def main():
                 assert ("OpenCL forward transformed tile" in log)==expected_transform,log
         assert outputs[0]==outputs[1]
         count+=1
-    print(f"PASS: {count-2} GPU-encoded codestreams and 2 fallback cases byte-identical to CPU; {root}")
+    print(f"PASS: {count-3} fused GPU codestreams and 3 fallback cases byte-identical to CPU; {root}")
 
 
 if __name__=="__main__":

@@ -6,6 +6,8 @@
 OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd, opj_event_mgr_t *manager);
 /* Encoder stages commit only after complete success; false requests the CPU
  * implementation of that stage. Enable separately with OPJ_OPENCL_ENCODE_DEVICE. */
+/* Fused path leaves all CPU input samples and blocks untouched on failure. */
+OPJ_BOOL opj_opencl_encode_tile(opj_tcd_t *tcd, opj_event_mgr_t *manager);
 OPJ_BOOL opj_opencl_encode_tier1(opj_tcd_t *tcd, opj_event_mgr_t *manager);
 OPJ_BOOL opj_opencl_encode_transform(opj_tcd_t *tcd, opj_event_mgr_t *manager);
 #endif
