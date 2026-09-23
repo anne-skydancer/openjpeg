@@ -14,6 +14,11 @@ def generate():
         if not match:
             raise ValueError("Missing upstream table: " + name)
         result += "__constant uchar " + name + "[" + str(count) + "] = {" + match[1] + "};\n"
+    for name in ("lut_nmsedec_sig", "lut_nmsedec_sig0", "lut_nmsedec_ref", "lut_nmsedec_ref0"):
+        match = re.search(r"static const OPJ_INT16 " + name + r"\[1U << T1_NMSEDEC_BITS\] = \{(.*?)\};", source, re.S)
+        if not match:
+            raise ValueError("Missing upstream table: " + name)
+        result += "__constant short " + name + "[128] = {" + match[1] + "};\n"
     return result
 
 

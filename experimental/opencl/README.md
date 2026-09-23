@@ -376,3 +376,70 @@ payloads, reference pixels and benchmark executables remain in ignored `build/`.
 Kernel behavior follows OpenJPEG v2.5.4 `t1.c`, `mqc.c`, `dwt.c`, `mct.c` and
 `tcd.c`. Upstream BSD notices are retained in adapted kernel sources and the
 embedded bundle. No Roger or xxjjss decoder code is copied.
+
+## GPU encoding (2026-09-23)
+
+The optional encoder accelerates level shifting, reversible/irreversible color
+transforms, forward 5/3 or 9/7 wavelets, and style-zero Tier-1 MQ entropy coding.
+Quantization, distortion weighting, rate allocation and Tier-2 packet assembly
+remain on the CPU. Both lossy and lossless encoding use the existing OpenJPEG
+API. Unsupported configurations or failed GPU stages use the original CPU stage;
+results are committed only after the entire GPU stage succeeds.
+
+Encoding is disabled by default and enabled independently of decoding:
+
+```powershell
+$env:OPJ_OPENCL_ENCODE_DEVICE = 'gfx1201'
+$env:OPJ_OPENCL_DRIVER = '3679'
+$env:OPJ_OPENCL_WORKERS = '4'
+```
+
+If decoding is also enabled, use the same literal device selector for
+`OPJ_OPENCL_DEVICE`. Both paths share the worker pool and its aggregate 64 MiB
+buffer limit. Driver allocations, kernels and CPU staging are additional.
+The transform path supports matching component geometry, 1-4 components,
+1-16-bit samples and dimensions up to 4096, subject to the buffer limit.
+Tier-1 currently requires coding style zero without ROI; other styles retain
+CPU entropy coding even when GPU transforms are eligible. Intermediate CPU
+quantization currently requires a device readback and another upload.
+
+`bench_encode` reuses the concurrent benchmark harness. It decodes input J2K
+files once before timing, then measures image cloning, encoder setup, encoding,
+memory-stream output and checksum generation. Use `--lossy 8` before positional
+arguments for an 8:1 target; otherwise encoding is lossless. Its
+`--write-reference DIRECTORY` and `--verify-reference DIRECTORY` options compare
+complete encoded codestream bytes. Reference directories must already exist.
+
+Repeated RelWithDebInfo results on RX 9070 XT / gfx1201, driver 3679, used 32
+private cached textures, three trials and five warm rounds per trial: 480
+measured encodes per configuration, excluding warmup. The middle trial reversed
+execution order. All output checksums agreed, and both GPU stage counts matched
+the encoded tile count. Values are mean textures/second across trials.
+
+| Mode | Image workers | CPU threads/image | Lossless | Lossy 8:1 |
+| --- | ---: | ---: | ---: | ---: |
+| CPU | 1 | 1 | 23.59 | 28.19 |
+| GPU | 1 | 1 | 33.80 | 30.45 |
+| CPU | 1 | 4 | 72.20 | 76.47 |
+| CPU | 4 | 1 | 81.79 | 105.94 |
+| GPU | 4 | 1 | 74.71 | 76.90 |
+
+GPU throughput improves about 43% losslessly and 8% lossily over one CPU thread,
+but multithreaded CPU encoding remains faster. These are current desktop
+measurements, not a controlled viewer-rendering-load qualification or a viewer
+FPS claim. Keep GPU encoding opt-in while reducing transfers and entropy cost.
+
+The encoder regression matrix requires byte-identical codestreams for 123 GPU
+cases and two fallback controls, including odd/tiled origins, short dimensions,
+8/16-bit signed/unsigned samples, 1/3/4 components, multiple rate layers and
+constant images. Concurrent exact-output tests exercise eight callers with
+1/2/4/8 GPU slots and the shared buffer cap. Hardware qualification is currently
+limited to this AMD device/driver.
+
+The separate optimized shared Release build (`build/gpu-encode/bin/Release`)
+passed all eight native CTest tests, the 29,184-block decoder reference corpus,
+and 128 exact real-cache GPU encodes (lossless/lossy, eight callers, four slots).
+The CPU-only Release library also builds. The existing `build/gpu-release`
+decoder DLL was preserved unchanged. Release uses /O2, /Ob3 and link-time
+optimization with precise floating-point semantics; the performance table above
+remains the measured RelWithDebInfo result rather than an inferred Release gain.

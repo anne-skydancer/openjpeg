@@ -8,6 +8,11 @@ add_executable(bench_workers bench_workers.c)
 target_include_directories(bench_workers PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
   "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
 target_link_libraries(bench_workers openjp2 Threads::Threads)
+add_executable(bench_encode bench_workers.c)
+target_compile_definitions(bench_encode PRIVATE OPJ_BENCH_ENCODING)
+target_include_directories(bench_encode PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
+  "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
+target_link_libraries(bench_encode openjp2 Threads::Threads)
 add_executable(test_opencl_reentrant test_reentrant.c)
 target_include_directories(test_opencl_reentrant PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
   "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
@@ -33,6 +38,16 @@ add_test(NAME opencl_idwt53
           --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
 set_tests_properties(opencl_idwt53 PROPERTIES LABELS "experimental;opencl" TIMEOUT 60 RUN_SERIAL TRUE)
 if(OPJ_ENABLE_OPENCL AND BUILD_CODEC)
+  add_test(NAME opencl_encode_workers
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_encode_workers.py"
+      --bin "$<TARGET_FILE_DIR:bench_encode>" --out "${CMAKE_CURRENT_BINARY_DIR}/encode-workers"
+      --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
+  set_tests_properties(opencl_encode_workers PROPERTIES LABELS "experimental;opencl" TIMEOUT 240 RUN_SERIAL TRUE)
+  add_test(NAME opencl_encode
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_encode.py"
+      --bin "$<TARGET_FILE_DIR:opj_compress>" --out "${CMAKE_CURRENT_BINARY_DIR}/encode"
+      --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
+  set_tests_properties(opencl_encode PROPERTIES LABELS "experimental;opencl" TIMEOUT 240 RUN_SERIAL TRUE)
   add_test(NAME opencl_complete
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_complete.py"
       --bin "$<TARGET_FILE_DIR:opj_decompress>" --out "${CMAKE_CURRENT_BINARY_DIR}/complete"

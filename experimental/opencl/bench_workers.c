@@ -25,6 +25,10 @@ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t
 
 typedef struct {
     const char *path;
+#ifdef OPJ_BENCH_ENCODING
+    opj_image_t *source;
+    unsigned transformed;
+#endif
     unsigned gpu_tiles, cpu_tiles, worker_mask, peak_active;
     unsigned long long peak_pool_bytes;
     unsigned long long checksum;
@@ -39,6 +43,23 @@ static int write_reference;
 static void info(const char *message,void *data)
 {
     job_result *job=(job_result*)data;
+#ifdef OPJ_BENCH_ENCODING
+    {
+        unsigned slot,active;unsigned long long bytes;int count=0;
+        if(strstr(message,"OpenCL encoded Tier-1 tile")) {
+            ++job->gpu_tiles;
+            count=sscanf(message,"OpenCL encoded Tier-1 tile %*u (%*u blocks) worker %u active %u pooled %llu",&slot,&active,&bytes);
+        } else if(strstr(message,"OpenCL forward transformed tile")) {
+            ++job->transformed;
+            count=sscanf(message,"OpenCL forward transformed tile %*u worker %u active %u pooled %llu",&slot,&active,&bytes);
+        }
+        if(count==3) {
+            if(slot<8)job->worker_mask|=1u<<slot;
+            if(active>job->peak_active)job->peak_active=active;
+            if(bytes>job->peak_pool_bytes)job->peak_pool_bytes=bytes;
+        }
+    }
+#else
     if(strstr(message,"OpenCL decoded tile")) {
         unsigned slot,active;
         unsigned long long bytes;
@@ -49,6 +70,7 @@ static void info(const char *message,void *data)
             if(bytes>job->peak_pool_bytes) job->peak_pool_bytes=bytes;
         }
     }
+#endif
     if(strstr(message,"Header of tile ")) ++job->cpu_tiles;
 }
 static void error(const char *message,void *data)
@@ -88,6 +110,115 @@ static int check_reference(opj_image_t *image,int index)
     if(!write_reference && fgetc(file)!=EOF) ok=0;
     if(fclose(file)) ok=0;
     return ok;
+}
+
+
+#ifdef OPJ_BENCH_ENCODING
+static int irreversible;
+static float encode_rate=1;
+typedef struct { unsigned char *data; size_t size,position,capacity; } sink;
+static int sink_grow(sink *s,size_t end)
+{
+    size_t capacity;unsigned char *data;
+    if(end>128u*1024u*1024u)return 0;
+    if(end<=s->capacity)return 1;
+    capacity=s->capacity?s->capacity:4096;
+    while(capacity<end)capacity*=2;
+    data=(unsigned char*)realloc(s->data,capacity);if(!data)return 0;
+    memset(data+s->capacity,0,capacity-s->capacity);s->data=data;s->capacity=capacity;return 1;
+}
+static OPJ_SIZE_T sink_write(void *data,OPJ_SIZE_T bytes,void *user)
+{
+    sink *s=(sink*)user;if(bytes>128u*1024u*1024u-s->position||!sink_grow(s,s->position+bytes))return (OPJ_SIZE_T)-1;
+    memcpy(s->data+s->position,data,bytes);s->position+=bytes;
+    if(s->position>s->size)s->size=s->position;return bytes;
+}
+static OPJ_BOOL sink_seek(OPJ_OFF_T at,void *user)
+{
+    sink *s=(sink*)user;if(at<0||at>128u*1024u*1024u||!sink_grow(s,(size_t)at))return OPJ_FALSE;
+    s->position=(size_t)at;if(s->position>s->size)s->size=s->position;return OPJ_TRUE;
+}
+static OPJ_OFF_T sink_skip(OPJ_OFF_T bytes,void *user)
+{
+    sink *s=(sink*)user;
+    if(bytes<-(OPJ_OFF_T)s->position||bytes>(OPJ_OFF_T)(128u*1024u*1024u-s->position))return -1;
+    return sink_seek((OPJ_OFF_T)s->position+bytes,user)?bytes:-1;
+}
+static opj_image_t *load_source(const char *path)
+{
+    opj_dparameters_t p;opj_image_t *image=NULL;int ok=0;
+    opj_codec_t *codec=opj_create_decompress(OPJ_CODEC_J2K);
+    opj_stream_t *stream=opj_stream_create_default_file_stream(path,OPJ_TRUE);
+    opj_set_default_decoder_parameters(&p);
+    if(codec&&stream&&opj_setup_decoder(codec,&p)&&opj_codec_set_threads(codec,1)&&
+       opj_read_header(stream,codec,&image)&&opj_decode(codec,stream,image)&&opj_end_decompress(codec,stream))ok=1;
+    if(codec)opj_destroy_codec(codec);if(stream)opj_stream_destroy(stream);
+    if(!ok&&image){opj_image_destroy(image);image=NULL;}return image;
+}
+static opj_image_t *copy_source(opj_image_t *source)
+{
+    unsigned c;opj_image_cmptparm_t *params;
+    opj_image_t *image;
+    params=(opj_image_cmptparm_t*)calloc(source->numcomps,sizeof(*params));if(!params)return NULL;
+    for(c=0;c<source->numcomps;c++) {
+        opj_image_comp_t *a=&source->comps[c];
+        params[c].w=a->w;params[c].h=a->h;params[c].dx=a->dx;params[c].dy=a->dy;
+        params[c].x0=a->x0;params[c].y0=a->y0;params[c].prec=a->prec;params[c].sgnd=a->sgnd;
+    }
+    image=opj_image_create(source->numcomps,params,source->color_space);free(params);if(!image)return NULL;
+    image->x0=source->x0;image->y0=source->y0;image->x1=source->x1;image->y1=source->y1;
+    for(c=0;c<source->numcomps;c++) {
+        memcpy(image->comps[c].data,source->comps[c].data,(size_t)source->comps[c].w*source->comps[c].h*4);
+        image->comps[c].alpha=source->comps[c].alpha;
+    }
+    return image;
+}
+static void encode_job(int index)
+{
+    job_result *job=&jobs[index];opj_cparameters_t p;unsigned c,min_length=~0u;
+    opj_image_t *image=copy_source(job->source);opj_codec_t *codec=NULL;opj_stream_t *stream=NULL;
+    sink output={0};size_t i;
+    job->transformed=0;
+    job->gpu_tiles=job->cpu_tiles=job->worker_mask=job->peak_active=0;
+    job->checksum=job->peak_pool_bytes=0;job->ok=0;
+    if(!image)goto done;
+    for(c=0;c<image->numcomps;c++) {
+        if(image->comps[c].w<min_length)min_length=image->comps[c].w;
+        if(image->comps[c].h<min_length)min_length=image->comps[c].h;
+    }
+    opj_set_default_encoder_parameters(&p);p.tcp_numlayers=1;p.tcp_rates[0]=encode_rate;
+    p.cp_disto_alloc=1;p.irreversible=irreversible;p.tcp_mct=image->numcomps>=3;
+    p.numresolution=1;while(min_length>=2 && p.numresolution<6){min_length/=2;++p.numresolution;}
+    codec=opj_create_compress(OPJ_CODEC_J2K);stream=opj_stream_create(65536,OPJ_FALSE);
+    if(!codec||!stream)goto done;
+    opj_set_info_handler(codec,info,job);opj_set_error_handler(codec,error,NULL);
+    opj_stream_set_user_data(stream,&output,NULL);opj_stream_set_write_function(stream,sink_write);
+    opj_stream_set_seek_function(stream,sink_seek);opj_stream_set_skip_function(stream,sink_skip);
+    if(!opj_setup_encoder(codec,&p,image)||!opj_codec_set_threads(codec,cpu_threads)||
+       !opj_start_compress(codec,image,stream)||!opj_encode(codec,stream)||!opj_end_compress(codec,stream))goto done;
+    job->cpu_tiles=1;
+    for(i=0;i<output.size;i++)job->checksum=job->checksum*33+output.data[i];
+    if(reference_dir) {
+        char path[4096];FILE *file;unsigned long long size=(unsigned long long)output.size;int ok;
+        int length=snprintf(path,sizeof(path),"%s/%d.codestream",reference_dir,index);
+        if(length<0||(size_t)length>=sizeof(path))goto done;
+        file=fopen(path,write_reference?"wb":"rb");if(!file)goto done;
+        ok=reference_bytes(file,&size,sizeof(size))&&reference_bytes(file,output.data,output.size);
+        if(!write_reference&&fgetc(file)!=EOF)ok=0;if(fclose(file))ok=0;if(!ok)goto done;
+    }
+    job->ok=1;
+done:
+    if(codec)opj_destroy_codec(codec);if(stream)opj_stream_destroy(stream);
+    if(image)opj_image_destroy(image);free(output.data);
+}
+#endif
+
+static void dispose_jobs(void)
+{
+#ifdef OPJ_BENCH_ENCODING
+    int i;if(jobs)for(i=0;i<job_count;i++)if(jobs[i].source)opj_image_destroy(jobs[i].source);
+#endif
+    free(jobs);
 }
 
 static void decode_job(int index)
@@ -131,7 +262,11 @@ static void *worker(void *unused)
         int index;
         LOCK(); index=next_job++; UNLOCK();
         if(index>=job_count) break;
+#ifdef OPJ_BENCH_ENCODING
+        encode_job(index);
+#else
         decode_job(index);
+#endif
     }
     return 0;
 }
@@ -141,15 +276,29 @@ int main(int argc,char **argv)
     thread_handle handles[32];
     int workers,repeat,round,i,created;
     unsigned gpu_tiles=0,tiles=0,worker_mask=0,peak_active=0;
+#ifdef OPJ_BENCH_ENCODING
+    unsigned transformed=0;
+#endif
     unsigned long long peak_pool_bytes=0;
     unsigned long long *expected=NULL;
     double cold=0,elapsed=0;
+#ifdef OPJ_BENCH_ENCODING
+    const char *count_name="warm_encodes";
+#else
+    const char *count_name="warm_decodes";
+#endif
+#ifdef OPJ_BENCH_ENCODING
+    if(argc>2 && !strcmp(argv[1],"--lossy")) {
+        encode_rate=(float)atof(argv[2]);irreversible=1;argc-=2;argv+=2;
+        if(!(encode_rate>=1))return 2;
+    }
+#endif
     if(argc>2 && (!strcmp(argv[1],"--write-reference") || !strcmp(argv[1],"--verify-reference"))) {
         write_reference=!strcmp(argv[1],"--write-reference");
         reference_dir=argv[2]; argc-=2; argv+=2;
     }
     if(argc<5) {
-        fprintf(stderr,"Usage: bench_workers [--write-reference DIR | --verify-reference DIR] workers cpu_threads repeats files...\n");
+        fprintf(stderr,"Usage: bench_workers/bench_encode [--lossy RATE (encoder only)] [--write-reference DIR | --verify-reference DIR] workers cpu_threads repeats files...\n");
         return 2;
     }
     workers=atoi(argv[1]); cpu_threads=atoi(argv[2]); repeat=atoi(argv[3]);
@@ -157,8 +306,14 @@ int main(int argc,char **argv)
     job_count=argc-4;
     jobs=(job_result*)calloc((size_t)job_count,sizeof(*jobs));
     expected=(unsigned long long*)calloc((size_t)job_count,sizeof(*expected));
-    if(!jobs || !expected) { free(jobs); free(expected); return 3; }
-    for(i=0;i<job_count;i++) jobs[i].path=argv[i+4];
+    if(!jobs || !expected) { dispose_jobs(); free(expected); return 3; }
+    for(i=0;i<job_count;i++) {
+        jobs[i].path=argv[i+4];
+#ifdef OPJ_BENCH_ENCODING
+        jobs[i].source=load_source(jobs[i].path);
+        if(!jobs[i].source){dispose_jobs();free(expected);return 3;}
+#endif
+    }
     for(round=0;round<=repeat;round++) {
         double started=now_ms();
         next_job=0;
@@ -178,23 +333,30 @@ int main(int argc,char **argv)
 #endif
         }
         if(!round) cold=now_ms()-started; else elapsed+=now_ms()-started;
-        if(created!=workers) { free(jobs); free(expected); return 4; }
+        if(created!=workers) { dispose_jobs(); free(expected); return 4; }
         for(i=0;i<job_count;i++) {
             if(!jobs[i].ok || (round && expected[i]!=jobs[i].checksum)) {
-                fprintf(stderr,"Decode or output verification failed for input %d\n",i);
-                free(jobs); free(expected); return 5;
+                fprintf(stderr,"Codec or output verification failed for input %d\n",i);
+                dispose_jobs(); free(expected); return 5;
             }
             expected[i]=jobs[i].checksum;
             gpu_tiles+=jobs[i].gpu_tiles; tiles+=jobs[i].cpu_tiles;
+#ifdef OPJ_BENCH_ENCODING
+            transformed+=jobs[i].transformed;
+#endif
             worker_mask|=jobs[i].worker_mask;
             if(jobs[i].peak_active>peak_active) peak_active=jobs[i].peak_active;
             if(jobs[i].peak_pool_bytes>peak_pool_bytes) peak_pool_bytes=jobs[i].peak_pool_bytes;
         }
     }
-    printf("{\"workers\":%d,\"cpu_threads\":%d,\"warm_decodes\":%d,\"cold_corpus_ms\":%.3f,\"warm_total_ms\":%.3f,\"warm_ms_per_image\":%.3f,\"images_per_second\":%.3f,\"gpu_tiles\":%u,\"tiles\":%u,\"checksums\":[",
-           workers,cpu_threads,repeat*job_count,cold,elapsed,elapsed/(repeat*job_count),1000.0*repeat*job_count/elapsed,gpu_tiles,tiles);
+    printf("{\"workers\":%d,\"cpu_threads\":%d,\"%s\":%d,\"cold_corpus_ms\":%.3f,\"warm_total_ms\":%.3f,\"warm_ms_per_image\":%.3f,\"images_per_second\":%.3f,\"gpu_tiles\":%u,\"tiles\":%u,\"checksums\":[",
+           workers,cpu_threads,count_name,repeat*job_count,cold,elapsed,elapsed/(repeat*job_count),1000.0*repeat*job_count/elapsed,gpu_tiles,tiles);
     for(i=0;i<job_count;i++) printf("%s\"%llu\"",i?",":"",expected[i]);
-    printf("],\"worker_mask\":%u,\"peak_active\":%u,\"peak_pool_bytes\":%llu}\n",worker_mask,peak_active,peak_pool_bytes);
+    printf("],\"worker_mask\":%u,\"peak_active\":%u,\"peak_pool_bytes\":%llu",worker_mask,peak_active,peak_pool_bytes);
+#ifdef OPJ_BENCH_ENCODING
+    printf(",\"gpu_transform_tiles\":%u,\"encoding\":true",transformed);
+#endif
+    puts("}");
     fflush(stdout);
-    free(jobs); free(expected); return 0;
+    dispose_jobs(); free(expected); return 0;
 }
