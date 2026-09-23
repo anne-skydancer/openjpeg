@@ -14,8 +14,8 @@ def load_blocks(path):
     if not blocks:
         raise ValueError("Empty corpus")
     for b in blocks:
-        if b["version"] != 1 or b["roi"] or b["corrupted"] or b["style"] & ~38:
-            raise ValueError("Unsupported capture: expected MQ, no ROI/VSC/RAW/HT/corruption")
+        if b["version"] != 1 or b["roi"] or b["corrupted"] or b["style"] & ~47:
+            raise ValueError("Unsupported capture: no ROI/PTERM/HT/corruption")
         w, h = b["width"], b["height"]
         if not (0 < w <= 1024 and 0 < h <= 1024 and w*h <= 4096):
             raise ValueError("Invalid block geometry")
@@ -32,6 +32,19 @@ def load_blocks(path):
             raise ValueError("Segment lengths do not cover payload")
         if sum(s[1] for s in b["segments"]) > max(0, 3*b["numbps"]-2):
             raise ValueError("Excess coding passes")
+        # RAW and MQ coding cannot share one arithmetic segment. An incomplete
+        # quality layer may end a segment early, but not change its coding mode.
+        bp, coding_pass = b["numbps"], 2
+        for _, passes in b["segments"]:
+            raw = bool(b["style"] & 1 and bp <= b["numbps"]-4 and coding_pass < 2)
+            for _ in range(passes):
+                mode = bool(b["style"] & 1 and bp <= b["numbps"]-4 and coding_pass < 2)
+                if raw != mode:
+                    raise ValueError("Mixed RAW and MQ passes in one segment")
+                coding_pass += 1
+                if coding_pass == 3:
+                    coding_pass = 0
+                    bp -= 1
     return blocks
 
 
@@ -72,9 +85,10 @@ def verify_batch(program, blocks):
         for index in (3, 5):
             data = arrays[index]
             cl.check(cl.EnqueueReadBuffer(program.queue, buffers[index], 1, 0, ct.sizeof(data), data, 0, None, None), "Tier-1 readback")
-        if any(arrays[5]):
-            failures = [(i, v) for i, v in enumerate(arrays[5]) if v]
+        if any(v & 255 for v in arrays[5]):
+            failures = [(i, v) for i, v in enumerate(arrays[5]) if v & 255]
             raise AssertionError(f"Kernel status errors: {failures[:10]}")
+        program.segsym_diagnostics = getattr(program, "segsym_diagnostics", 0) + sum(bool(v & 256) for v in arrays[5])
         offset = 0
         for index, b in enumerate(blocks):
             expected = b["coefficients"]
@@ -116,6 +130,16 @@ def main():
     finally:
         program.close()
     print(f"PASS: {len(blocks)} Tier-1 blocks / {count} coefficients exactly match OpenJPEG")
+    raw_segments = 0
+    for b in blocks:
+        bp, coding_pass = b["numbps"], 2
+        for _, passes in b["segments"]:
+            raw_segments += bool(b["style"] & 1 and bp <= b["numbps"]-4 and coding_pass < 2)
+            bp -= (coding_pass + passes)//3
+            coding_pass = (coding_pass + passes)%3
+    print(f"Coverage: {len(set(b['style'] for b in blocks))} styles, {raw_segments} RAW segments, "
+          f"{sum(bool(b['style'] & 8) for b in blocks)} VSC blocks")
+    print(f"Nonfatal segmentation-symbol diagnostics: {program.segsym_diagnostics}")
 
 
 if __name__ == "__main__":

@@ -15,11 +15,12 @@ class DescriptorValidation(unittest.TestCase):
                      style=0, roi=0, corrupted=0, coefficients=[3],
                      segments=[[1, 1]], bytes="00")
         mutations = [dict(version=2), dict(roi=1), dict(corrupted=1),
-                     dict(style=1), dict(style=8), dict(style=16), dict(style=64),
+                     dict(style=16), dict(style=64), dict(style=-1),
                      dict(width=0), dict(height=-1), dict(width=1025),
                      dict(orientation=4), dict(numbps=31), dict(coefficients=[]),
                      dict(segments=[[2, 1]]), dict(segments=[[-1, 1]]),
                      dict(segments=[[1, 2]]), dict(segments=[[1, 0]]),
+                     dict(style=1, numbps=8, segments=[[1, 22]]),
                      dict(bytes="zz")]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "blocks.jsonl"

@@ -26,21 +26,22 @@ def generate(binary_dir, directory):
         for pattern, pixels in enumerate(patterns):
             pgm = directory / f"source-{size_index}-{pattern}.pgm"
             pgm.write_bytes(f"P5\n{w} {h}\n255\n".encode() + pixels)
-            for style in (0, 2, 4, 6, 32, 34, 36, 38):
+            for style in (s for s in range(48) if not s & 16):
                 for irreversible in (False, True):
                     name = f"{size_index}-{pattern}-{style}-{int(irreversible)}"
                     encoded = directory / (name + ".j2k")
                     args = [str(compressor), "-i", str(pgm), "-o", str(encoded),
-                            "-n", "3", "-b", "64,64" if size_index == 2 else "16,16", "-M", str(style)]
+                            "-n", "3", "-b", "64,64" if size_index == 2 else "16,16",
+                            "-M", str(style), "-r", "8,1"]
                     if irreversible:
                         args.append("-I")
                     result = subprocess.run(args, env=env, capture_output=True, text=True, check=True)
                     logs.append(result.stdout + result.stderr)
-                    for discard in (0, 1):
+                    for discard, layer in ((0, 0), (1, 0), (0, 1)):
                         decode_env = dict(env, OPJ_T1_CAPTURE_FILE=str(capture.resolve()))
                         result = subprocess.run([str(decoder), "-i", str(encoded),
                                                  "-o", str(directory / "decoded.pgm"),
-                                                 "-r", str(discard), "-threads", "1"],
+                                                 "-r", str(discard), "-l", str(layer), "-threads", "1"],
                                                 env=decode_env, capture_output=True, text=True, check=True)
                         logs.append(result.stdout + result.stderr)
     (directory / "generation.log").write_text("\n".join(logs), encoding="utf-8")
