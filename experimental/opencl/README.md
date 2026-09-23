@@ -4,10 +4,11 @@ This branch starts at OpenJPEG **v2.5.4**, commit
 `6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an optional native
 OpenCL decoding backend without changing the public OpenJPEG API.
 
-**Status: functional experimental backend, not a performance win.** On the
-current RX 9070 XT corpus, the optimized GPU path is about three times slower
-than the single-thread CPU path. It remains disabled by default. Vulkanstorm's
-package and shipping decoder have not been changed.
+**Status: experimental backend with a measured gain over one CPU thread.**
+The current RX 9070 XT corpus averages 20.124 ms per texture on the GPU versus
+27.541 ms with one CPU decoding thread. CPU decoding with two or more threads
+is still faster on this corpus. The backend remains disabled by default;
+Vulkanstorm's package and shipping decoder have not been changed.
 
 ## Decoding path
 
@@ -24,11 +25,28 @@ Coefficients and reconstructed planes remain on the GPU between these stages.
 The final planar integer samples return through the existing OpenJPEG API.
 This is not direct GPU texture upload or asynchronous viewer integration.
 
-A persistent context, in-order queue, program and kernels are reused. Job
-buffers currently allocate per tile; pooling and cross-image batching are still
-future work. The entropy kernel assigns one work-item per code block. Cached
-neighbor flags, packed MQ contexts and 32-lane interleaved scratch reduce its
-cost; the layout does not require vendor extensions or a particular wave size.
+A persistent context, in-order queue, program, kernels and device buffers are
+reused. Buffer capacity across the pool stays within the 64 MiB aggregate cap;
+independent high-water marks cannot accumulate beyond it. Failed jobs drain the
+queue and discard their pooled buffers before freeing host staging.
+
+Tier-1 assigns one code block to each one-item work-group. Its significance and
+cardinal-sign flags fit in 16 bits per coefficient and reside in dynamically
+sized local memory (at most 8 KiB per group). Independent streams therefore do
+not share divergent instruction execution within a wave. Packed MQ contexts
+remain in private storage. Coefficients and compressed bytes stay in global
+memory; experiments moving these into local memory were slower.
+
+Placement and wavelet reconstruction use 64-item work-groups. Each wavelet group
+cooperates on one row or column, with barriers between dependent lifting phases
+and dynamically sized local scratch. This removes the global flags and wavelet
+scratch buffers entirely. Kernel status and pixels are checked at the final
+readback, avoiding the previous host wait between entropy and reconstruction.
+
+The host backend is thread-safe, but admits one GPU tile job at a time; concurrent
+callers use CPU fallback. It does not yet batch images or keep multiple GPU jobs
+in flight. That requires separate job arguments/buffers and a shared total memory
+budget, rather than allowing each worker its own 64 MiB pool.
 
 ## Build and select a device
 
@@ -87,7 +105,9 @@ first-layer decoding. Separate cases exercise signed and unsigned 16-bit data. A
 392 component images** passed on the qualified device.
 
 `test_fallback.py` checks exact CPU output for an invalid device selector and
-for a 4096-square image exceeding the device working budget. A separate clean
+for a 4096-square image exceeding the device working budget.
+`test_reuse.py` also exercises a small/large/CPU-fallback/small sequence four
+times in one process, verifying matching output checksums and 12 GPU tile jobs. A separate clean
 RelWithDebInfo CPU-only library builds without either the OpenCL selector or
 reference-capture environment-variable string. The OpenCL-enabled
 RelWithDebInfo shared DLL also builds successfully; 17 selected upstream
@@ -132,40 +152,76 @@ handling or viewer image quality across every texture.
 
 `bench_decode` is a development-only public-API benchmark. It decodes the 32
 cached textures in one process, excludes its first corpus pass from the warm
-mean, uses one CPU decoding thread and includes identical output checksumming
-in both modes. Files are warm; context/program initialization is excluded from
-the GPU warm mean. Three measured rounds give 96 warm decodes per mode.
+mean, and includes identical output checksumming in both modes. Files are warm;
+context/program initialization is excluded from the GPU warm mean. This is
+codec latency, not viewer FPS, total texture-arrival time or multi-image throughput.
 
-| Path | Mean time per texture |
+Historical measurements on the same corpus:
+
+| GPU implementation | Mean time per texture |
 | --- | ---: |
-| CPU | 25.514 ms |
-| Initial complete GPU backend | 142.002 ms |
-| Cached neighbor contexts | 89.653 ms |
-| Packed MQ contexts | 81.154 ms |
-| Interleaved flag scratch | **75.311 ms** |
+| Initial complete backend | 142.002 ms |
+| Previous committed optimized backend | 75.311 ms |
+| Previous backend remeasured before this pass | 75.410 ms |
+| Local Tier-1 flags | 29.421 ms |
+| Parallel wavelet reconstruction | 23.426 ms |
+| Compact 16-bit flags | 21.934 ms |
+| Dynamic local scratch; removed global scratch | 20.433 ms |
 
-CPU and GPU output checksums agree. The optimized GPU path takes about 47%
-less time than the initial GPU version, but remains **2.95 times slower than
-CPU**. Profiling after the neighbor-context optimization attributed about
-74.8 ms to Tier-1 and 7.2 ms to DWT per warm texture; placement and finishing
-were much smaller. This identifies Tier-1 as the main optimization target,
-without proving a specific hardware cause. These are codec timings, not viewer
-FPS or texture-arrival measurements.
+Final comparison uses three separate runs per mode, five warm corpus rounds
+per run: **480 measured decodes per mode**, plus warm-ups. Execution order was
+CPU/GPU, GPU/CPU, CPU/GPU. Every GPU decode used the backend and output checksums
+matched the CPU across all runs.
+
+| Decoder | Mean | Range of run means |
+| --- | ---: | ---: |
+| CPU, one thread | 27.541 ms | 27.170-27.872 ms |
+| Optimized GPU | **20.124 ms** | **20.092-20.168 ms** |
+
+This is about **73% less GPU decode time / 3.75x throughput** than the remeasured
+previous commit, and **27% less time / 1.37x throughput** than one CPU thread.
+The throughput ratios describe this sequential warm benchmark only.
+
+A separate five-round CPU thread-count comparison, with matching checksums:
+
+| CPU decoder threads | Mean per texture |
+| --- | ---: |
+| 1 | 27.379 ms |
+| 2 | 16.816 ms |
+| 4 | 12.415 ms |
+| 8 | 9.703 ms |
+
+**The GPU backend does not beat the multithreaded CPU decoder here.** These runs
+process images sequentially with multiple CPU workers inside each decode; they
+do not measure several viewer texture workers decoding independent images.
+
+Optional profiling on the final kernels measured average device execution of
+9.669 ms for Tier-1, 0.020 ms for placement, 0.215 ms for DWT and 0.014 ms for
+finishing. Kernel time excludes CPU parsing, planning, API submission, transfers,
+checksumming and other host work, so it must not be substituted for end-to-end
+latency. Tier-1 remains the main device execution cost.
+
+Rejected experiments included local coefficient storage, two entropy streams
+per group, bulk MQ renormalization, explicit neighbor-update unrolling, indexed
+MQ context arrays, compressed-input local caching, and combined component DWT
+dispatch. They did not improve the measured result enough to keep.
 
 ```powershell
 $inputs = Get-ChildItem build/cache-corpus/*.j2k | ForEach-Object FullName
 Remove-Item Env:OPJ_OPENCL_DEVICE -ErrorAction SilentlyContinue
-build/gpu/bin/RelWithDebInfo/bench_decode.exe 3 @inputs
+build/gpu/bin/RelWithDebInfo/bench_decode.exe --threads 1 5 @inputs
+build/gpu/bin/RelWithDebInfo/bench_decode.exe --threads 4 5 @inputs
 $env:OPJ_OPENCL_DEVICE = 'gfx1201'
 $env:OPJ_OPENCL_DRIVER = '3679'
-build/gpu/bin/RelWithDebInfo/bench_decode.exe 3 @inputs
+build/gpu/bin/RelWithDebInfo/bench_decode.exe 5 @inputs
 ```
 
-The next performance work is entropy execution/scheduling and larger batches
-across independent textures, followed by buffer reuse and more parallel wavelet
-reconstruction. Further qualification must cover malformed/truncated streams,
-contention and device failure before package/viewer integration. Do not enable
-this backend by default based on functionality alone.
+The remaining opportunities are improving entropy execution and overlapping
+independent images with CPU parsing and transfers. Cross-image batching needs
+an explicit scheduling design; adding CPU decoder threads alone does not make
+the current single-job GPU queue concurrent. Further qualification must cover
+malformed/truncated streams, contention and device failure before package/viewer
+integration. Keep the backend opt-in until workload-level results justify it.
 
 ## Provenance
 

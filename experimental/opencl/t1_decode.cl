@@ -42,7 +42,8 @@
  * MQ arithmetic and context semantics adapted from OpenJPEG v2.5.4.
  * Upstream copyright and license are retained in mq_states.clh.
  * Experimental Part 1 MQ/RAW path, ROI undo and PTERM diagnostics; no HT.
- * This is a correctness implementation, not an optimized production backend.
+ * Each one-item work-group owns bounded local flags, avoiding global-memory
+ * neighbor traffic and divergence between independent entropy streams.
  */
 typedef struct { uint a, c, ct, pos, synthesized; uint ctx0, ctx1, ctx2, ctx3, ctx4; } MQ;
 
@@ -117,19 +118,19 @@ uint decision(MQ *m, __global const uchar *src, uint length, uint context)
 /* Cache neighboring significance and sign bits per coefficient. A newly
  * significant sample updates adjacent contexts once, instead of each future
  * coding decision gathering eight separate global-memory neighbors.
- * Low 9 bits are a 3x3 significance map (self at bit 4); sign map at bits 16..24.
+ * Low 9 bits are a 3x3 significance map (self at bit 4); cardinal sign bits at 11..14.
  * VISITED=512, REFINED=1024. VSC suppresses northward propagation at stripe starts.
  */
-#define F(at) flags[(at)*32]
+#define F(at) flags[(at)]
 #define SIG 16u
 #define VISITED 512u
 #define REFINED 1024u
 #define NEIGHBORS 495u
-int neighbors(__global const uint *flags, int x, int y, int w, int h, uint style)
+int neighbors(__local const ushort *flags, int x, int y, int w, int h, uint style)
 {
     return (F(y*w+x) & NEIGHBORS) != 0;
 }
-uint zero_context(__global const uint *flags, int x, int y, int w, int h, uint orient, uint style)
+uint zero_context(__local const ushort *flags, int x, int y, int w, int h, uint orient, uint style)
 {
     uint f=F(y*w+x);
     int hc=popcount(f & 40u), vc=popcount(f & 130u), dc=popcount(f & 325u);
@@ -145,10 +146,10 @@ uint zero_context(__global const uint *flags, int x, int y, int w, int h, uint o
 }
 int sign_contribution(uint f,uint bit)
 {
-    return (f & (1u<<bit)) ? ((f & (1u<<(bit+16))) ? -1 : 1) : 0;
+    return (f & (1u<<bit)) ? ((f & (1u<<(11+(bit-1)/2))) ? -1 : 1) : 0;
 }
 void decode_sign(MQ *m, __global const uchar *src, uint length,
-                 __global int *data, __global uint *flags,
+                 __global int *data, __local ushort *flags,
                  int x, int y, int w, int h, int value, uint style, uint raw)
 {
     uint f=F(y*w+x);
@@ -165,26 +166,26 @@ void decode_sign(MQ *m, __global const uchar *src, uint length,
         if((dx==0 && dy==0) || tx<0 || tx>=w || ty<0 || ty>=h) continue;
         if((style&8) && (y&3)==0 && dy==-1) continue;
         uint bit=(1-dy)*3+(1-dx);
-        F(ty*w+tx) |= (1u<<bit) | (sign<<(bit+16));
+        F(ty*w+tx) |= (1u<<bit) | ((bit&1) ? (sign<<(11+(bit-1)/2)) : 0u);
     }
 }
 
 /* Descriptor: w,h,orientation,numbps,style,inputOffset,inputLength,
- * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm,scratchOffset.
+ * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm.
  * Segments: length, passCount.
  * Host verifies every range before upload; each block owns disjoint scratch.
  */
+__attribute__((reqd_work_group_size(1,1,1)))
 __kernel void decode_blocks(__global const uint *desc, __global const uint2 *segments,
                             __global const uchar *input, __global int *output,
-                            __global uint *scratch, __global uint *status, uint count)
+                            __local ushort *flags, __global uint *status, uint count)
 {
     size_t block = get_global_id(0);
     if (block >= count) return;
-    __global const uint *d = desc + block*13;
+    __global const uint *d = desc + block*12;
     int w = d[0], h = d[1];
     uint orient = d[2], style = d[4], offset = 0;
     __global int *data = output + d[9];
-    __global uint *flags = scratch + d[12];
     status[block] = 0;
     if (style & ~63u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30 || d[10] > 30 || d[3]+d[10] > 30) {
         status[block] = 1; return;

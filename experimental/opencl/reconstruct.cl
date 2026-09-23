@@ -46,15 +46,17 @@
  */
 #pragma OPENCL FP_CONTRACT OFF
 
+__attribute__((reqd_work_group_size(64,1,1)))
 __kernel void place_blocks(__global const uint *desc, __global const uint4 *place,
                            __global const float *scale, __global const int *coeff,
                            __global int *planes, uint count, uint reversible)
 {
-    uint b = get_global_id(0);
+    uint b = get_group_id(0);
     if (b >= count) return;
     uint4 p = place[b]; /* destination, stride, width, height */
-    uint offset = desc[b*13+9];
-    for (uint y=0; y<p.w; ++y) for (uint x=0; x<p.z; ++x) {
+    uint offset = desc[b*12+9];
+    for (uint at=get_local_id(0); at<p.z*p.w; at+=64) {
+        uint y=at/p.z, x=at-y*p.z;
         int v = coeff[offset+y*p.z+x];
         uint target = p.x+y*p.y+x;
         if (reversible) planes[target] = v/2;
@@ -62,47 +64,52 @@ __kernel void place_blocks(__global const uint *desc, __global const uint4 *plac
     }
 }
 
-/* One work-item owns an entire line; scratch lines are disjoint. This first
- * complete implementation favors transparent arithmetic over throughput.
- * Horizontal and vertical dispatches are ordered by the host queue. */
-__kernel void inverse_line(__global int *planes, __global int *scratch,
+/* A 64-item work-group cooperates on one line in local memory. Barriers
+ * separate dependent lifting phases; the in-order queue separates axes. */
+__attribute__((reqd_work_group_size(64,1,1)))
+__kernel void inverse_line(__global int *planes, __local int *tmp,
                            uint base, uint stride, uint length, uint lines,
                            uint low_count, uint parity, uint vertical, uint reversible)
 {
-    uint line = get_global_id(0);
+    uint line = get_group_id(0);
+    uint lane = get_local_id(0);
     if (line >= lines) return;
     uint origin = base + (vertical ? line : line*stride);
     uint step = vertical ? stride : 1;
-    __global int *tmp = scratch + line*length;
-    __global float *f = (__global float*)tmp;
-    for (uint i=0; i<length; ++i) {
+    __local float *f = (__local float*)tmp;
+    for (uint i=lane; i<length; i+=64) {
         uint source = ((i+parity)&1) ? low_count+i/2 : i/2;
         tmp[i] = planes[origin+source*step];
     }
+    barrier(CLK_LOCAL_MEM_FENCE);
     if (reversible) {
-        if (length == 1) { if (parity) tmp[0] /= 2; }
+        if (length == 1) { if (parity && lane == 0) tmp[0] /= 2; }
         else {
-            for (uint i=parity; i<length; i+=2) {
+            for (uint i=parity+2*lane; i<length; i+=128) {
                 uint l=i ? i-1 : 1, r=i+1<length ? i+1 : i-1;
                 tmp[i] -= (tmp[l]+tmp[r]+2)>>2;
             }
-            for (uint i=1-parity; i<length; i+=2) {
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (uint i=1-parity+2*lane; i<length; i+=128) {
                 uint l=i ? i-1 : 1, r=i+1<length ? i+1 : i-1;
                 tmp[i] += (tmp[l]+tmp[r])>>1;
             }
         }
     } else if (length > 1) {
-        for (uint i=0; i<length; ++i)
+        for (uint i=lane; i<length; i+=64)
             f[i] *= ((i+parity)&1) ? 1.625732422f : 1.230174105f;
+        barrier(CLK_LOCAL_MEM_FENCE);
         const float lift[4] = {-0.443506852f,-0.882911075f,0.052980118f,1.586134342f};
         for (uint phase=0; phase<4; ++phase) {
-            for (uint i=(phase&1) ? 1-parity : parity; i<length; i+=2) {
+            for (uint i=((phase&1) ? 1-parity : parity)+2*lane; i<length; i+=128) {
                 uint l=i ? i-1 : 1, r=i+1<length ? i+1 : i-1;
                 f[i] = f[i] + (f[l]+f[r])*lift[phase];
             }
+            barrier(CLK_LOCAL_MEM_FENCE);
         }
     }
-    for (uint i=0; i<length; ++i) planes[origin+i*step] = tmp[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint i=lane; i<length; i+=64) planes[origin+i*step] = tmp[i];
 }
 
 __kernel void finish_pixels(__global int *planes, uint samples, uint components,

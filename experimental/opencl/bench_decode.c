@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause
- * Development benchmark: warm file cache, same process/context, one CPU thread.
+ * Development benchmark: warm file cache, same process/context.
  */
 #include "openjpeg.h"
 #include <stdio.h>
@@ -18,11 +18,16 @@ static void error(const char *message,void *data) { (void)data; fputs(message,st
 
 int main(int argc,char **argv)
 {
-    int repeat,round,i;
+    int repeat,round,i,threads=1;
     unsigned decoded=0;
     double started,elapsed=0,cold=0;
     unsigned long long checksum=0;
-    if(argc<3) { fprintf(stderr,"Usage: bench_decode repeats file.j2k ...\n"); return 2; }
+    if(argc>2 && !strcmp(argv[1],"--threads")) {
+        threads=atoi(argv[2]); argc-=2; argv+=2;
+    }
+    if(argc<3 || threads<1 || threads>256) {
+        fprintf(stderr,"Usage: bench_decode [--threads N] repeats file.j2k ...\n"); return 2;
+    }
     repeat=atoi(argv[1]); if(repeat<1 || repeat>100) return 2;
     for(round=0;round<=repeat;round++) {
         started=now_ms();
@@ -37,7 +42,7 @@ int main(int argc,char **argv)
             stream=opj_stream_create_default_file_stream(argv[i],OPJ_TRUE);
             if(!codec || !stream) return 3;
             opj_set_info_handler(codec,info,NULL); opj_set_error_handler(codec,error,NULL);
-            if(!opj_setup_decoder(codec,&parameters) || !opj_codec_set_threads(codec,1) ||
+            if(!opj_setup_decoder(codec,&parameters) || !opj_codec_set_threads(codec,threads) ||
                !opj_read_header(stream,codec,&image) || !opj_decode(codec,stream,image) ||
                !opj_end_decompress(codec,stream)) return 4;
             for(c=0;c<image->numcomps;c++) {
@@ -48,7 +53,7 @@ int main(int argc,char **argv)
         }
         if(!round) cold=now_ms()-started; else elapsed+=now_ms()-started;
     }
-    printf("{\"images\":%u,\"warm_decodes\":%d,\"cold_corpus_ms\":%.3f,\"warm_total_ms\":%.3f,\"warm_mean_ms\":%.3f,\"gpu_tiles\":%u,\"checksum\":\"%llu\"}\n",
-           decoded,repeat*(argc-2),cold,elapsed,elapsed/(repeat*(argc-2)),gpu_tiles,checksum);
+    printf("{\"images\":%u,\"warm_decodes\":%d,\"cpu_threads\":%d,\"cold_corpus_ms\":%.3f,\"warm_total_ms\":%.3f,\"warm_mean_ms\":%.3f,\"gpu_tiles\":%u,\"checksum\":\"%llu\"}\n",
+           decoded,repeat*(argc-2),threads,cold,elapsed,elapsed/(repeat*(argc-2)),gpu_tiles,checksum);
     return 0;
 }

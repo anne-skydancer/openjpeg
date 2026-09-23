@@ -30,7 +30,7 @@ static pthread_mutex_t cl_lock = PTHREAD_MUTEX_INITIALIZER;
 X(GetPlatformIDs) X(GetDeviceIDs) X(GetDeviceInfo) X(CreateContext) \
 X(CreateCommandQueue) X(CreateProgramWithSource) X(BuildProgram) \
 X(GetProgramBuildInfo) X(CreateKernel) X(CreateBuffer) X(SetKernelArg) \
-X(EnqueueNDRangeKernel) X(EnqueueReadBuffer) X(Finish) X(ReleaseMemObject) \
+X(EnqueueNDRangeKernel) X(EnqueueWriteBuffer) X(EnqueueReadBuffer) X(Finish) X(ReleaseMemObject) \
 X(ReleaseKernel) X(ReleaseProgram) X(ReleaseCommandQueue) X(ReleaseContext) \
 X(GetEventProfilingInfo) X(ReleaseEvent)
 /* Function pointer signatures match the Khronos OpenCL 1.2 declarations. */
@@ -48,6 +48,7 @@ DECL(cl_mem,CreateBuffer,(cl_context,cl_mem_flags,size_t,void*,cl_int*));
 DECL(cl_int,SetKernelArg,(cl_kernel,cl_uint,size_t,const void*));
 DECL(cl_int,EnqueueNDRangeKernel,(cl_command_queue,cl_kernel,cl_uint,const size_t*,const size_t*,const size_t*,cl_uint,const cl_event*,cl_event*));
 DECL(cl_int,EnqueueReadBuffer,(cl_command_queue,cl_mem,cl_bool,size_t,size_t,void*,cl_uint,const cl_event*,cl_event*));
+DECL(cl_int,EnqueueWriteBuffer,(cl_command_queue,cl_mem,cl_bool,size_t,size_t,const void*,cl_uint,const cl_event*,cl_event*));
 DECL(cl_int,Finish,(cl_command_queue));
 DECL(cl_int,ReleaseMemObject,(cl_mem)); DECL(cl_int,ReleaseKernel,(cl_kernel));
 DECL(cl_int,ReleaseProgram,(cl_program)); DECL(cl_int,ReleaseCommandQueue,(cl_command_queue));
@@ -63,15 +64,27 @@ static struct {
     cl_program program;
     cl_kernel kernels[4];
     char selector[256], driver[256];
+    cl_mem buffers[8];
+    size_t capacities[8];
     int profiling;
     cl_event events[260];
     unsigned stages[260], event_count;
 } runtime;
 
+static void release_buffers(void)
+{
+    unsigned i;
+    for(i=0;i<8;i++) {
+        if(runtime.buffers[i]) fnReleaseMemObject(runtime.buffers[i]);
+        runtime.buffers[i]=NULL; runtime.capacities[i]=0;
+    }
+}
+
 static void destroy_runtime(void)
 {
     int i;
     if (runtime.queue) fnFinish(runtime.queue);
+    release_buffers();
     for (i=0;i<4;i++) if (runtime.kernels[i]) {
         fnReleaseKernel(runtime.kernels[i]); runtime.kernels[i]=NULL;
     }
@@ -142,7 +155,7 @@ fail:
 
 #define BUDGET (64u*1024u*1024u)
 typedef struct {
-    OPJ_UINT32 blocks, segments, bytes, coefficients, flag_cells;
+    OPJ_UINT32 blocks, segments, bytes, coefficients, max_block_samples;
     OPJ_UINT32 *desc, *segs, *place, *status;
     OPJ_BYTE *input;
     float *scale;
@@ -160,7 +173,7 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
                            OPJ_UINT32 samples, OPJ_UINT32 components, int copy)
 {
     OPJ_UINT32 c,r,b,pr,k,s,ch;
-    OPJ_UINT32 nb=0, ns=0, nbytes=0, nc=0, group_start=0, group_max=0;
+    OPJ_UINT32 nb=0, ns=0, nbytes=0, nc=0, max_samples=0;
     for(c=0;c<components;c++) {
         opj_tcd_tilecomp_t *tc=&tcd->tcd_image->tiles->comps[c];
         opj_tccp_t *coding=&tcd->tcp->tccps[c];
@@ -206,12 +219,11 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
                         if(band->bandno&2) y+=tc->resolutions[r-1].y1-tc->resolutions[r-1].y0;
                         if(x<0 || y<0 || (OPJ_UINT32)(x+w)>stride || (OPJ_UINT64)(y+h)*stride>samples) return OPJ_FALSE;
                         if(copy) {
-                            OPJ_UINT32 *d=p->desc+nb*13, *place=p->place+nb*4;
+                            OPJ_UINT32 *d=p->desc+nb*12, *place=p->place+nb*4;
                             d[0]=w;d[1]=h;d[2]=band->bandno;d[3]=block->numbps;d[4]=coding->cblksty;
                             d[5]=nbytes;d[6]=(OPJ_UINT32)len;d[7]=ns;d[8]=block->real_num_segs;d[9]=nc;
                             d[10]=(OPJ_UINT32)coding->roishift;
                             d[11]=(tcd->tcp->num_layers_to_decode==tcd->tcp->numlayers && (tcd->tcp->tccps[0].cblksty&16)) ? 1:0;
-                            d[12]=group_start+(nb%32);
                             place[0]=c*samples+y*stride+x;place[1]=stride;place[2]=w;place[3]=h;
                             p->scale[nb]=0.5f*band->stepsize;
                             for(ch=0;ch<block->numchunks;ch++) {
@@ -223,15 +235,14 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
                                 p->segs[(ns+s)*2+1]=block->segs[s].real_num_passes;
                             }
                         }
-                        group_max=opj_uint_max(group_max,(OPJ_UINT32)(w*h));
-                        if(nb%32==31) { group_start+=group_max*32; group_max=0; }
+                        max_samples=opj_uint_max(max_samples,(OPJ_UINT32)(w*h));
                         ++nb; ns+=block->real_num_segs; nbytes+=(OPJ_UINT32)len; nc+=w*h;
                     }
                 }
             }
         }
     }
-    if(!copy) { p->blocks=nb;p->segments=ns;p->bytes=nbytes;p->coefficients=nc;p->flag_cells=group_start+group_max*32; }
+    if(!copy) { p->blocks=nb;p->segments=ns;p->bytes=nbytes;p->coefficients=nc;p->max_block_samples=max_samples; }
     return nb>0;
 }
 
@@ -240,9 +251,11 @@ static int arg(cl_kernel k,cl_uint index,size_t size,const void *value)
 static int run(cl_kernel k,size_t count)
 {
     cl_event event=NULL;
+    size_t local=(k==runtime.kernels[1] || k==runtime.kernels[2])?64:1;
+    if(local==64) count*=64;
     unsigned i;
     if(!count) return 1;
-    if(fnEnqueueNDRangeKernel(runtime.queue,k,1,NULL,&count,NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
+    if(fnEnqueueNDRangeKernel(runtime.queue,k,1,NULL,&count,k!=runtime.kernels[3]?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
     if(event) {
         if(runtime.event_count>=260) { fnReleaseEvent(event); return 0; }
         for(i=0;i<4;i++) if(k==runtime.kernels[i]) break;
@@ -266,9 +279,10 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     OPJ_UINT64 total,budget;
     OPJ_BOOL success=OPJ_FALSE,locked=OPJ_FALSE;
     decode_plan p={0};
-    cl_mem mem[10]={0};
-    size_t sizes[10];
-    void *host[10]={0};
+    /* desc, segments, input, coefficients, status, placement, scale, planes */
+    cl_mem mem[8]={0};
+    size_t sizes[8];
+    void *host[8]={0};
     OPJ_INT32 *result=NULL;
     cl_kernel kernel;
     cl_int error=CL_SUCCESS;
@@ -296,39 +310,51 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     if(!LOCK()) return OPJ_FALSE;
     locked=OPJ_TRUE;
     if(!plan_blocks(tcd,&p,width,samples,components,0)) goto cleanup;
-    sizes[0]=(size_t)p.blocks*13*4; sizes[1]=opj_uint_max(1,p.segments)*2*4;
+    sizes[0]=(size_t)p.blocks*12*4; sizes[1]=opj_uint_max(1,p.segments)*2*4;
     sizes[2]=opj_uint_max(1,p.bytes); sizes[3]=(size_t)p.coefficients*4;
-    sizes[4]=(size_t)p.flag_cells*4; sizes[5]=(size_t)p.blocks*4;
-    sizes[6]=(size_t)p.blocks*4*4; sizes[7]=(size_t)p.blocks*4;
-    sizes[8]=(size_t)total*4; sizes[9]=(size_t)samples*4;
-    budget=0;for(i=0;i<10;i++) budget+=sizes[i];
+    sizes[4]=(size_t)p.blocks*4;
+    sizes[5]=(size_t)p.blocks*4*4; sizes[6]=(size_t)p.blocks*4;
+    sizes[7]=(size_t)total*4;
+    budget=0;for(i=0;i<8;i++) budget+=sizes[i];
     if(budget>BUDGET || !initialize(selector,driver,manager)) goto cleanup;
     p.desc=(OPJ_UINT32*)opj_malloc(sizes[0]);p.segs=(OPJ_UINT32*)opj_calloc(1,sizes[1]);
-    p.input=(OPJ_BYTE*)opj_calloc(1,sizes[2]);p.status=(OPJ_UINT32*)opj_malloc(sizes[5]);
-    p.place=(OPJ_UINT32*)opj_malloc(sizes[6]);p.scale=(float*)opj_malloc(sizes[7]);
-    result=(OPJ_INT32*)opj_calloc(1,sizes[8]);
+    p.input=(OPJ_BYTE*)opj_calloc(1,sizes[2]);p.status=(OPJ_UINT32*)opj_malloc(sizes[4]);
+    p.place=(OPJ_UINT32*)opj_malloc(sizes[5]);p.scale=(float*)opj_malloc(sizes[6]);
+    result=(OPJ_INT32*)opj_calloc(1,sizes[7]);
     if(!p.desc||!p.segs||!p.input||!p.status||!p.place||!p.scale||!result) goto cleanup;
     if(!plan_blocks(tcd,&p,width,samples,components,1)) goto cleanup;
-    host[0]=p.desc;host[1]=p.segs;host[2]=p.input;host[6]=p.place;host[7]=p.scale;host[8]=result;
-    for(i=0;i<10;i++) {
-        mem[i]=fnCreateBuffer(runtime.context,CL_MEM_READ_WRITE|(host[i]?CL_MEM_COPY_HOST_PTR:0),sizes[i],host[i],&error);
-        if(!mem[i] || error) goto cleanup;
+    host[0]=p.desc;host[1]=p.segs;host[2]=p.input;host[5]=p.place;host[6]=p.scale;host[7]=result;
+    /* Reuse device allocations without allowing independent high-water marks
+     * to grow beyond the same aggregate working budget. Host writes remain
+     * alive until the cleanup fence, including every failure path. */
+    budget=0;
+    for(i=0;i<8;i++) budget+=sizes[i]>runtime.capacities[i]?sizes[i]:runtime.capacities[i];
+    if(budget>BUDGET) release_buffers();
+    for(i=0;i<8;i++) {
+        if(!sizes[i]) continue;
+        if(runtime.capacities[i]<sizes[i]) {
+            if(runtime.buffers[i]) fnReleaseMemObject(runtime.buffers[i]);
+            runtime.capacities[i]=0;
+            runtime.buffers[i]=fnCreateBuffer(runtime.context,CL_MEM_READ_WRITE,sizes[i],NULL,&error);
+            if(!runtime.buffers[i] || error) goto cleanup;
+            runtime.capacities[i]=sizes[i];
+        }
+        mem[i]=runtime.buffers[i];
+        if(host[i] && fnEnqueueWriteBuffer(runtime.queue,mem[i],CL_FALSE,0,sizes[i],host[i],0,NULL,NULL)) goto cleanup;
     }
     kernel=runtime.kernels[0];
-    for(i=0;i<6;i++) ARG(kernel,i,mem[i]);
+    for(i=0;i<4;i++) { ARG(kernel,i,mem[i]); }
+    ARG(kernel,5,mem[4]);
+    if(!arg(kernel,4,(size_t)p.max_block_samples*2,NULL)) goto cleanup;
     ARG(kernel,6,p.blocks);
     if(!run(kernel,p.blocks)) goto cleanup;
-    if(fnEnqueueReadBuffer(runtime.queue,mem[5],CL_TRUE,0,sizes[5],p.status,0,NULL,NULL)) goto cleanup;
-    for(i=0;i<p.blocks;i++) {
-        if(p.status[i]&255) goto cleanup;
-        if(p.status[i]&1536) opj_event_msg(manager,EVT_WARNING,"OpenCL PTERM diagnostic %u\n",p.status[i]&1536);
-    }
     kernel=runtime.kernels[1];
-    ARG(kernel,0,mem[0]);ARG(kernel,1,mem[6]);ARG(kernel,2,mem[7]);ARG(kernel,3,mem[3]);
-    ARG(kernel,4,mem[8]);ARG(kernel,5,p.blocks);ARG(kernel,6,rev);
+    ARG(kernel,0,mem[0]);ARG(kernel,1,mem[5]);ARG(kernel,2,mem[6]);ARG(kernel,3,mem[3]);
+    ARG(kernel,4,mem[7]);ARG(kernel,5,p.blocks);ARG(kernel,6,rev);
     if(!run(kernel,p.blocks)) goto cleanup;
     kernel=runtime.kernels[2];
-    ARG(kernel,0,mem[8]);ARG(kernel,1,mem[9]);ARG(kernel,3,width);ARG(kernel,9,rev);
+    ARG(kernel,0,mem[7]);ARG(kernel,3,width);ARG(kernel,9,rev);
+    if(!arg(kernel,1,(size_t)opj_uint_max(width,height)*4,NULL)) goto cleanup;
     for(c=0;c<components;c++) {
         OPJ_UINT32 base=c*samples;
         ARG(kernel,2,base);
@@ -344,10 +370,16 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
         }
     }
     kernel=runtime.kernels[3];
-    ARG(kernel,0,mem[8]);ARG(kernel,1,samples);ARG(kernel,2,components);ARG(kernel,3,mct);
+    ARG(kernel,0,mem[7]);ARG(kernel,1,samples);ARG(kernel,2,components);ARG(kernel,3,mct);
     ARG(kernel,4,rev);ARG(kernel,5,precision);ARG(kernel,6,sgnd);ARG(kernel,7,shift);
     if(!run(kernel,samples)) goto cleanup;
-    if(fnEnqueueReadBuffer(runtime.queue,mem[8],CL_TRUE,0,sizes[8],result,0,NULL,NULL)) goto cleanup;
+    if(fnEnqueueReadBuffer(runtime.queue,mem[4],CL_FALSE,0,sizes[4],p.status,0,NULL,NULL)) goto cleanup;
+    if(fnEnqueueReadBuffer(runtime.queue,mem[7],CL_TRUE,0,sizes[7],result,0,NULL,NULL)) goto cleanup;
+    for(i=0;i<p.blocks;i++) {
+        if(p.status[i]&255) goto cleanup;
+        if(p.status[i]&1536) opj_event_msg(manager,EVT_WARNING,"OpenCL PTERM diagnostic %u\n",p.status[i]&1536);
+    }
+
     for(c=0;c<components;c++) memcpy(tile->comps[c].data,result+c*samples,(size_t)samples*4);
     success=OPJ_TRUE;
     opj_event_msg(manager,EVT_INFO,"OpenCL decoded tile %u (%u blocks)\n",tcd->tcd_tileno,p.blocks);
@@ -365,7 +397,7 @@ cleanup:
         runtime.event_count=0;
         opj_event_msg(manager,EVT_INFO,"OpenCL timings: T1 %.3f place %.3f DWT %.3f finish %.3f ms\n",ms[0],ms[1],ms[2],ms[3]);
     }
-    for(i=0;i<10;i++) if(mem[i]) fnReleaseMemObject(mem[i]);
+    if(locked && !success) release_buffers();
     free_plan(&p);opj_free(result);
     if(locked) UNLOCK();
     return success;

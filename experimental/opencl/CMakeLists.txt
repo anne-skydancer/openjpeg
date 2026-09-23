@@ -34,6 +34,11 @@ if(OPJ_ENABLE_OPENCL AND BUILD_CODEC)
       --bin "$<TARGET_FILE_DIR:opj_decompress>" --out "${CMAKE_CURRENT_BINARY_DIR}/fallback"
       --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
   set_tests_properties(opencl_fallback PROPERTIES LABELS "experimental;opencl" TIMEOUT 120 RUN_SERIAL TRUE)
+  add_test(NAME opencl_reuse
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_reuse.py"
+      --bin "$<TARGET_FILE_DIR:bench_decode>" --out "${CMAKE_CURRENT_BINARY_DIR}/reuse"
+      --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
+  set_tests_properties(opencl_reuse PROPERTIES LABELS "experimental;opencl" TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 add_test(NAME opencl_t1_validation
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_t1_validation.py")

@@ -60,30 +60,28 @@ def verify_batch(program, blocks):
     cl = program.cl
     desc, segments, reference = [], [], []
     payload = bytearray()
-    flag_offsets=[]
-    flag_cells=0
-    for start in range(0,len(blocks),32):
-        group=blocks[start:start+32]
-        flag_offsets.extend(flag_cells+i for i in range(len(group)))
-        flag_cells+=32*max(b["width"]*b["height"] for b in group)
-    for block_index,b in enumerate(blocks):
+    local_bytes=2*max(b["width"]*b["height"] for b in blocks)
+    for b in blocks:
         desc.extend((b["width"], b["height"], b["orientation"], b["numbps"], b["style"],
                      len(payload), len(b["payload"]), len(segments)//2, len(b["segments"]), len(reference),
-                     b["roi"], b["check_pterm"], flag_offsets[block_index]))
+                     b["roi"], b["check_pterm"]))
         for segment in b["segments"]:
             segments.extend(segment)
         payload.extend(b["payload"])
         reference.extend(b["coefficients"])
-    # Distinct output/scratch sentinels expose unwritten values.
+    # Output/status sentinels expose unwritten values; flags use local memory.
     arrays = [(UINT * len(desc))(*desc),
               (UINT * max(1, len(segments)))(*segments),
               (ct.c_ubyte * max(1, len(payload)))(*payload),
               (INT * len(reference))(*([123456789] * len(reference))),
-              (UINT * flag_cells)(*([0xffffffff] * flag_cells)),
+              None,
               (UINT * len(blocks))(*([99] * len(blocks)))]
     buffers = []
     try:
         for data in arrays:
+            if data is None:
+                buffers.append(None)
+                continue
             error = INT()
             handle = cl.CreateBuffer(program.context, 1 | 32, ct.sizeof(data), data, ct.byref(error))
             if handle:
@@ -94,9 +92,12 @@ def verify_batch(program, blocks):
         kernel = program.kernels[0]
         args = [HANDLE(h) for h in buffers] + [UINT(len(blocks))]
         for index, value in enumerate(args):
+            if index==4:
+                cl.check(cl.SetKernelArg(kernel,index,local_bytes,None), "Tier-1 local scratch")
+                continue
             cl.check(cl.SetKernelArg(kernel, index, ct.sizeof(value), ct.byref(value)), "Tier-1 argument")
         shape = (SIZE * 1)(len(blocks) + 3)
-        cl.check(cl.EnqueueNDRangeKernel(program.queue, kernel, 1, None, shape, None, 0, None, None), "Tier-1 dispatch")
+        cl.check(cl.EnqueueNDRangeKernel(program.queue, kernel, 1, None, shape, (SIZE * 1)(1), 0, None, None), "Tier-1 dispatch")
         for index in (3, 5):
             data = arrays[index]
             cl.check(cl.EnqueueReadBuffer(program.queue, buffers[index], 1, 0, ct.sizeof(data), data, 0, None, None), "Tier-1 readback")
@@ -119,7 +120,7 @@ def verify_batch(program, blocks):
     finally:
         cl.Finish(program.queue)
         for buffer in reversed(buffers):
-            cl.ReleaseMemObject(buffer)
+            if buffer: cl.ReleaseMemObject(buffer)
 
 
 def main():
