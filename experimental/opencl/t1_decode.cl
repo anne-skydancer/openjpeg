@@ -41,10 +41,10 @@
  * Experimental scalar-per-block JPEG2000 Tier-1 decoder, OpenCL C 1.2.
  * MQ arithmetic and context semantics adapted from OpenJPEG v2.5.4.
  * Upstream copyright and license are retained in mq_states.clh.
- * Experimental Part 1 MQ/RAW path; ROI, PTERM checks and HT not yet supported.
+ * Experimental Part 1 MQ/RAW path, ROI undo and PTERM diagnostics; no HT.
  * This is a correctness implementation, not an optimized production backend.
  */
-typedef struct { uint a, c, ct, pos; uint context[19]; } MQ;
+typedef struct { uint a, c, ct, pos, synthesized; uint context[19]; } MQ;
 
 uint input_byte(__global const uchar *src, uint length, uint pos)
 {
@@ -54,7 +54,7 @@ void bytein(MQ *m, __global const uchar *src, uint length)
 {
     uint next = input_byte(src, length, m->pos + 1);
     if (input_byte(src, length, m->pos) == 255) {
-        if (next > 143) { m->c += 0xff00; m->ct = 8; }
+        if (next > 143) { m->c += 0xff00; m->ct = 8; ++m->synthesized; }
         else { ++m->pos; m->c += next << 9; m->ct = 7; }
     } else { ++m->pos; m->c += next << 8; m->ct = 8; }
 }
@@ -77,7 +77,7 @@ uint raw_decision(MQ *m, __global const uchar *src, uint length)
 }
 void init_segment(MQ *m, __global const uchar *src, uint length)
 {
-    m->pos = 0; m->c = input_byte(src, length, 0) << 16;
+    m->pos = 0; m->synthesized = 0; m->c = input_byte(src, length, 0) << 16;
     bytein(m, src, length); m->c <<= 7; m->ct -= 7; m->a = 0x8000;
 }
 uint decision(MQ *m, __global const uchar *src, uint length, uint context)
@@ -153,7 +153,8 @@ void decode_sign(MQ *m, __global const uchar *src, uint length,
 }
 
 /* Descriptor: w,h,orientation,numbps,style,inputOffset,inputLength,
- * segmentOffset,segmentCount,coefficientOffset. Segments: length, passCount.
+ * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm.
+ * Segments: length, passCount.
  * Host verifies every range before upload; each block owns disjoint scratch.
  */
 __kernel void decode_blocks(__global const uint *desc, __global const uint2 *segments,
@@ -162,20 +163,21 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
 {
     size_t block = get_global_id(0);
     if (block >= count) return;
-    __global const uint *d = desc + block*10;
+    __global const uint *d = desc + block*12;
     int w = d[0], h = d[1];
     uint orient = d[2], style = d[4], offset = 0;
     __global int *data = output + d[9];
     __global uchar *flags = scratch + d[9];
     status[block] = 0;
-    if (style & ~47u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30) {
+    if (style & ~63u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30 || d[10] > 30 || d[3]+d[10] > 30) {
         status[block] = 1; return;
     }
     for (int i = 0; i < w*h; ++i) { data[i] = 0; flags[i] = 0; }
-    MQ m; reset_contexts(&m);
-    int bp = d[3]; uint pass = 2;
+    MQ m; reset_contexts(&m); m.synthesized = 0;
+    int bp = d[3]+d[10]; uint pass = 2, last_length = 0;
     for (uint seg = 0; seg < d[8]; ++seg) {
         uint2 s = segments[d[7]+seg];
+        last_length = s.x;
         if (offset > d[6] || s.x > d[6]-offset) { status[block] = 2; return; }
         __global const uchar *src = input + d[5] + offset;
         offset += s.x;
@@ -229,6 +231,20 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
             }
             if ((style & 2) && !raw) reset_contexts(&m);
             if (++pass == 3) { pass = 0; --bp; }
+        }
+    }
+    if (d[11] && d[8]) {
+        if (m.pos + 2 < last_length) status[block] |= 512;
+        else if (m.synthesized > 2) status[block] |= 1024;
+    }
+    if (d[10]) {
+        int threshold = 1 << d[10];
+        for (int i = 0; i < w*h; ++i) {
+            int magnitude = abs(data[i]);
+            if (magnitude >= threshold) {
+                magnitude >>= d[10];
+                data[i] = data[i] < 0 ? -magnitude : magnitude;
+            }
         }
     }
 }

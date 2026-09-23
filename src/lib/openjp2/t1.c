@@ -1737,18 +1737,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
     cblk_w = t1->w;
     cblk_h = t1->h;
 
-#ifdef OPJ_CAPTURE_T1_REFERENCES
-    if (!opj_capture_t1(cblk, band, tilec, tccp, resno, datap,
-                       cblk_w, cblk_h, job->p_manager_mutex)) {
-        if (job->p_manager_mutex) { opj_mutex_lock(job->p_manager_mutex); }
-        opj_event_msg(job->p_manager, EVT_ERROR, "Tier-1 reference capture failed\n");
-        if (job->p_manager_mutex) { opj_mutex_unlock(job->p_manager_mutex); }
-        *(job->pret) = OPJ_FALSE;
-        opj_free(job);
-        return;
-    }
-#endif
-
     if (tccp->roishift) {
         if (tccp->roishift >= 31) {
             for (j = 0; j < cblk_h; ++j) {
@@ -1770,6 +1758,19 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
             }
         }
     }
+
+#ifdef OPJ_CAPTURE_T1_REFERENCES
+    if (!opj_capture_t1(cblk, band, tilec, tccp, resno, datap,
+                       cblk_w, cblk_h, &t1->mqc, job->check_pterm,
+                       job->p_manager_mutex)) {
+        if (job->p_manager_mutex) { opj_mutex_lock(job->p_manager_mutex); }
+        opj_event_msg(job->p_manager, EVT_ERROR, "Tier-1 reference capture failed\n");
+        if (job->p_manager_mutex) { opj_mutex_unlock(job->p_manager_mutex); }
+        *(job->pret) = OPJ_FALSE;
+        opj_free(job);
+        return;
+    }
+#endif
 
     /* Both can be non NULL if for example decoding a full tile and then */
     /* partially a tile. In which case partial decoding should be the */

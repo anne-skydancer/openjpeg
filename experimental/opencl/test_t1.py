@@ -14,8 +14,16 @@ def load_blocks(path):
     if not blocks:
         raise ValueError("Empty corpus")
     for b in blocks:
-        if b["version"] != 1 or b["roi"] or b["corrupted"] or b["style"] & ~47:
-            raise ValueError("Unsupported capture: no ROI/PTERM/HT/corruption")
+        if b["version"] != 2 or b.get("stage") != "post_roi" or b["corrupted"] or b["style"] & ~63:
+            raise ValueError("Unsupported capture: expected post-ROI Part 1 reference")
+        if not (0 <= b["roi"] <= 30 and b["numbps"] + b["roi"] <= 30):
+            raise ValueError("Invalid ROI bitplane range")
+        if b["check_pterm"] not in (0, 1) or b["pterm_status"] not in (0, 512, 1024):
+            raise ValueError("Invalid PTERM metadata")
+        if b["check_pterm"] and not b["style"] & 16:
+            raise ValueError("PTERM check without coding flag")
+        if not b["check_pterm"] and b["pterm_status"]:
+            raise ValueError("PTERM diagnostic without a check")
         w, h = b["width"], b["height"]
         if not (0 < w <= 1024 and 0 < h <= 1024 and w*h <= 4096):
             raise ValueError("Invalid block geometry")
@@ -30,11 +38,11 @@ def load_blocks(path):
             raise ValueError("Invalid segment")
         if sum(s[0] for s in b["segments"]) != len(b["payload"]):
             raise ValueError("Segment lengths do not cover payload")
-        if sum(s[1] for s in b["segments"]) > max(0, 3*b["numbps"]-2):
+        if sum(s[1] for s in b["segments"]) > max(0, 3*(b["numbps"]+b["roi"])-2):
             raise ValueError("Excess coding passes")
         # RAW and MQ coding cannot share one arithmetic segment. An incomplete
         # quality layer may end a segment early, but not change its coding mode.
-        bp, coding_pass = b["numbps"], 2
+        bp, coding_pass = b["numbps"]+b["roi"], 2
         for _, passes in b["segments"]:
             raw = bool(b["style"] & 1 and bp <= b["numbps"]-4 and coding_pass < 2)
             for _ in range(passes):
@@ -54,7 +62,8 @@ def verify_batch(program, blocks):
     payload = bytearray()
     for b in blocks:
         desc.extend((b["width"], b["height"], b["orientation"], b["numbps"], b["style"],
-                     len(payload), len(b["payload"]), len(segments)//2, len(b["segments"]), len(reference)))
+                     len(payload), len(b["payload"]), len(segments)//2, len(b["segments"]), len(reference),
+                     b["roi"], b["check_pterm"]))
         for segment in b["segments"]:
             segments.extend(segment)
         payload.extend(b["payload"])
@@ -91,6 +100,8 @@ def verify_batch(program, blocks):
         program.segsym_diagnostics = getattr(program, "segsym_diagnostics", 0) + sum(bool(v & 256) for v in arrays[5])
         offset = 0
         for index, b in enumerate(blocks):
+            if arrays[5][index] & 1536 != b["pterm_status"]:
+                raise AssertionError(f"Block {index}: GPU PTERM {arrays[5][index] & 1536} != CPU {b['pterm_status']}")
             expected = b["coefficients"]
             actual = list(arrays[3][offset:offset+len(expected)])
             if actual != expected:
@@ -132,7 +143,7 @@ def main():
     print(f"PASS: {len(blocks)} Tier-1 blocks / {count} coefficients exactly match OpenJPEG")
     raw_segments = 0
     for b in blocks:
-        bp, coding_pass = b["numbps"], 2
+        bp, coding_pass = b["numbps"]+b["roi"], 2
         for _, passes in b["segments"]:
             raw_segments += bool(b["style"] & 1 and bp <= b["numbps"]-4 and coding_pass < 2)
             bp -= (coding_pass + passes)//3
@@ -140,6 +151,9 @@ def main():
     print(f"Coverage: {len(set(b['style'] for b in blocks))} styles, {raw_segments} RAW segments, "
           f"{sum(bool(b['style'] & 8) for b in blocks)} VSC blocks")
     print(f"Nonfatal segmentation-symbol diagnostics: {program.segsym_diagnostics}")
+    print(f"ROI blocks: {sum(bool(b['roi']) for b in blocks)}; "
+          f"PTERM checks: {sum(b['check_pterm'] for b in blocks)}; "
+          f"CPU-matched PTERM diagnostics: {sum(bool(b['pterm_status']) for b in blocks)}")
 
 
 if __name__ == "__main__":

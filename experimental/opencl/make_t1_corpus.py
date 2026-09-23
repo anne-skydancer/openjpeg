@@ -26,7 +26,7 @@ def generate(binary_dir, directory):
         for pattern, pixels in enumerate(patterns):
             pgm = directory / f"source-{size_index}-{pattern}.pgm"
             pgm.write_bytes(f"P5\n{w} {h}\n255\n".encode() + pixels)
-            for style in (s for s in range(48) if not s & 16):
+            for style in range(64):
                 for irreversible in (False, True):
                     name = f"{size_index}-{pattern}-{style}-{int(irreversible)}"
                     encoded = directory / (name + ".j2k")
@@ -35,6 +35,10 @@ def generate(binary_dir, directory):
                             "-M", str(style), "-r", "8,1"]
                     if irreversible:
                         args.append("-I")
+                    # Exercise component ROI upshift across all coding styles;
+                    # the random pattern retains the non-ROI control path.
+                    if pattern < 2:
+                        args.extend(("-ROI", f"c=0,U={3 if pattern == 0 else 5}"))
                     result = subprocess.run(args, env=env, capture_output=True, text=True, check=True)
                     logs.append(result.stdout + result.stderr)
                     for discard, layer in ((0, 0), (1, 0), (0, 1)):

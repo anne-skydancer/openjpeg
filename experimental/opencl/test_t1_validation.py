@@ -11,11 +11,13 @@ from test_t1 import load_blocks
 
 class DescriptorValidation(unittest.TestCase):
     def test_rejects_invalid_descriptors(self):
-        valid = dict(version=1, width=1, height=1, orientation=0, numbps=1,
+        valid = dict(version=2, stage="post_roi", check_pterm=0, pterm_status=0,
+                     width=1, height=1, orientation=0, numbps=1,
                      style=0, roi=0, corrupted=0, coefficients=[3],
                      segments=[[1, 1]], bytes="00")
-        mutations = [dict(version=2), dict(roi=1), dict(corrupted=1),
-                     dict(style=16), dict(style=64), dict(style=-1),
+        mutations = [dict(version=1), dict(stage="pre_roi"), dict(roi=30), dict(roi=-1), dict(corrupted=1),
+                     dict(check_pterm=1), dict(pterm_status=7), dict(pterm_status=512),
+                     dict(style=64), dict(style=-1),
                      dict(width=0), dict(height=-1), dict(width=1025),
                      dict(orientation=4), dict(numbps=31), dict(coefficients=[]),
                      dict(segments=[[2, 1]]), dict(segments=[[-1, 1]]),
