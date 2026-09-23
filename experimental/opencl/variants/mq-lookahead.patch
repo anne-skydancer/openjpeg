@@ -1,0 +1,89 @@
+--- a/experimental/opencl/t1_decode.cl
++++ b/experimental/opencl/t1_decode.cl
+@@ -116,6 +116,41 @@
+     } while (m->a < 0x8000);
+     return bit;
+ }
++uint decision_path(MQ *m, __global const uchar *src, uint length, uint context,uint low)
++{
++    uint4 s = mq_states[context_state(m,context)]; /* Qe, MPS, NMPS, NLPS */
++    uint bit;
++    m->a -= s.x;
++    if (low) {
++        if (m->a < s.x) { bit = s.y; set_context(m,context,s.z); }
++        else { bit = 1 - s.y; set_context(m,context,s.w); }
++        m->a = s.x;
++    } else {
++        m->c -= s.x << 16;
++        if (m->a & 0x8000) return s.y;
++        if (m->a < s.x) { bit = 1 - s.y; set_context(m,context,s.w); }
++        else { bit = s.y; set_context(m,context,s.z); }
++    }
++    do {
++        if (!m->ct) bytein(m, src, length);
++        m->a <<= 1; m->c <<= 1; --m->ct;
++    } while (m->a < 0x8000);
++    return bit;
++}
++/* Experimental two-decision lookahead. Evaluate both arithmetic exchange
++ * paths and their next decision, then commit only the actual first path.
++ * Speculative input accesses use the same bounded synthesized-byte reader. */
++uint2 decision_pair(MQ *m,__global const uchar *src,uint length,uint c0,uint c1)
++{
++    uint low=(m->c>>16)<mq_states[context_state(m,c0)].x;
++    MQ lower=*m,upper=*m;
++    uint l0=decision_path(&lower,src,length,c0,1);
++    uint u0=decision_path(&upper,src,length,c0,0);
++    uint l1=decision(&lower,src,length,c1);
++    uint u1=decision(&upper,src,length,c1);
++    if(low) { *m=lower; return (uint2)(l0,l1); }
++    *m=upper; return (uint2)(u0,u1);
++}
+ /* Four-row stripe flags, following OpenJPEG's SIGMA/CHI/MU/PI layout.
+  * Bits 0..17: significance for three columns and six rows (with vertical halo).
+  * Bits 18,19,22,25,28,31: vertical sign samples, including the halo.
+@@ -213,6 +248,34 @@
+     }
+ }
+
++/* Refinement contexts are stable for the duration of this pass. Pair only
++ * eligible coefficients, preserving stripe order and handling an odd tail. */
++void refine_pairs(MQ *m,__global const uchar *src,uint length,
++    __global int *data,__local uint *flags,int w,int h,int midpoint)
++{
++    int pending=-1,px=0,py=0; uint pc=0;
++    for(int stripe=0;stripe<h;stripe+=4) for(int x=0;x<w;++x)
++        for(int j=0;j<min(4,h-stripe);++j) {
++            int y=stripe+j,at=y*w+x;
++            uint f=sample_flags(flags,x,y,w);
++            if((f&(SIG|VISITED))!=SIG) continue;
++            uint context=14+((f&REFINED)?2:(f&NEIGHBORS)?1:0);
++            if(pending<0) { pending=at; px=x;py=y;pc=context; }
++            else {
++                uint2 bits=decision_pair(m,src,length,pc,context);
++                data[pending]+=(bits.x^(data[pending]<0))?midpoint:-midpoint;
++                data[at]+=(bits.y^(data[at]<0))?midpoint:-midpoint;
++                mark_flag(flags,px,py,w,1u<<20);mark_flag(flags,x,y,w,1u<<20);
++                pending=-1;
++            }
++        }
++    if(pending>=0) {
++        uint bit=decision(m,src,length,pc);
++        data[pending]+=(bit^(data[pending]<0))?midpoint:-midpoint;
++        mark_flag(flags,px,py,w,1u<<20);
++    }
++}
++
+ /* Descriptor: w,h,orientation,numbps,style,inputOffset,inputLength,
+  * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm.
+  * Segments: length, passCount.
+@@ -250,7 +313,8 @@
+             int midpoint = (1 << bp) >> 1, value = (1 << bp) | midpoint;
+             /* The common 64x64/MQ path gives the compiler constant geometry,
+              * coding style and pass. Edge blocks and all other styles stay GPU. */
+-            if (w==64 && h==64 && style==0) {
++            if (pass==1 && !raw) refine_pairs(&m,src,s.x,data,flags,w,h,midpoint);
++            else if (w==64 && h==64 && style==0) {
+                 if (pass==0) decode_pass(&m,src,s.x,data,flags,64,64,orient,0,0,0,midpoint,value);
+                 else if (pass==1) decode_pass(&m,src,s.x,data,flags,64,64,orient,0,1,0,midpoint,value);
+                 else decode_pass(&m,src,s.x,data,flags,64,64,orient,0,2,0,midpoint,value);

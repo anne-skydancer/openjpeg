@@ -161,7 +161,7 @@ static OPJ_BOOL initialize(const char *selector, const char *driver, char *warni
     if (!runtime.context || error) goto fail;
     runtime.profiling=getenv("OPJ_OPENCL_PROFILE")!=NULL;
     runtime.device=selected;
-    runtime.program=fnCreateProgramWithSource(runtime.context,3,(const char**)opj_cl_sources,NULL,&error);
+    runtime.program=fnCreateProgramWithSource(runtime.context,(cl_uint)(sizeof(opj_cl_sources)/sizeof(opj_cl_sources[0])),(const char**)opj_cl_sources,NULL,&error);
     if (!runtime.program || error) goto fail;
     error=fnBuildProgram(runtime.program,1,&selected,"-cl-std=CL1.2",NULL,NULL);
     if (error) {
@@ -271,7 +271,7 @@ static void release_worker(decode_worker *worker,OPJ_BOOL success)
 }
 
 typedef struct {
-    OPJ_UINT32 blocks, segments, bytes, coefficients, max_block_samples;
+    OPJ_UINT32 blocks, segments, bytes, coefficients, max_flag_bytes;
     OPJ_UINT32 *desc, *segs, *place, *status;
     OPJ_BYTE *input;
     float *scale;
@@ -289,7 +289,7 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
                            OPJ_UINT32 samples, OPJ_UINT32 components, int copy)
 {
     OPJ_UINT32 c,r,b,pr,k,s,ch;
-    OPJ_UINT32 nb=0, ns=0, nbytes=0, nc=0, max_samples=0;
+    OPJ_UINT32 nb=0, ns=0, nbytes=0, nc=0, max_flags=0;
     for(c=0;c<components;c++) {
         opj_tcd_tilecomp_t *tc=&tcd->tcd_image->tiles->comps[c];
         opj_tccp_t *coding=&tcd->tcp->tccps[c];
@@ -351,14 +351,15 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
                                 p->segs[(ns+s)*2+1]=block->segs[s].real_num_passes;
                             }
                         }
-                        max_samples=opj_uint_max(max_samples,(OPJ_UINT32)(w*h));
+                        /* Four rows share a word; partial stripes still need a full word. */
+                        max_flags=opj_uint_max(max_flags,(OPJ_UINT32)(w*((h+3)/4)*4));
                         ++nb; ns+=block->real_num_segs; nbytes+=(OPJ_UINT32)len; nc+=w*h;
                     }
                 }
             }
         }
     }
-    if(!copy) { p->blocks=nb;p->segments=ns;p->bytes=nbytes;p->coefficients=nc;p->max_block_samples=max_samples; }
+    if(!copy) { p->blocks=nb;p->segments=ns;p->bytes=nbytes;p->coefficients=nc;p->max_flag_bytes=max_flags; }
     return nb>0;
 }
 
@@ -452,7 +453,7 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     kernel=worker->kernels[0];
     for(i=0;i<4;i++) { ARG(kernel,i,mem[i]); }
     ARG(kernel,5,mem[4]);
-    if(!arg(kernel,4,(size_t)p.max_block_samples*2,NULL)) goto cleanup;
+    if(!arg(kernel,4,(size_t)p.max_flag_bytes,NULL)) goto cleanup;
     ARG(kernel,6,p.blocks);
     if(!run(worker,kernel,p.blocks)) goto cleanup;
     kernel=worker->kernels[1];

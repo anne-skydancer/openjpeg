@@ -97,6 +97,22 @@ def main():
                         run.mkdir()
                         components += compare(source,binary,run,gpu_env,cpu_env,discard,layer)
                         count += 1
+        # Packed stripe scratch must cover partial four-row columns even when
+        # an image is narrower/shorter than its nominal code-block geometry.
+        for w,h,block in ((1024,1,"1024,4"),(1024,3,"1024,4"),
+                          (1,1024,"4,1024"),(3,1024,"4,1024"),
+                          (512,5,"512,8"),(5,512,"8,512")):
+            raw = root / f"edge-{w}-{h}.raw"
+            raw.write_bytes(bytes(rng.randrange(256) for _ in range(w*h)))
+            for style in (0,63):
+                case=root / f"edge-{w}-{h}-{style}"
+                case.mkdir()
+                source=case / "source.j2k"
+                execute([binary / ("opj_compress"+SUFFIX), "-i", raw, "-o", source,
+                         "-F", f"{w},{h},1,8,u", "-n", 1, "-b", block,
+                         "-M", style],cpu_env)
+                components += compare(source,binary,case,gpu_env,cpu_env)
+                count += 1
         # Exercise the upper admitted precision and signed output independently
         # of the larger 8-bit geometry/style matrix above.
         for signed in (False, True):

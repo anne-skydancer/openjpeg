@@ -1,0 +1,153 @@
+--- a/experimental/opencl/t1_decode.cl
++++ b/experimental/opencl/t1_decode.cl
+@@ -213,34 +213,75 @@
+     }
+ }
+
++/* Experimental 32-lane refinement. Each lane owns a four-row column;
++ * only lane zero advances MQ, in the standard column/row decision order. */
++void refine_cooperative(MQ *m,__global const uchar *src,uint length,
++    __global int *data,__local uint *flags,int w,int h,uint raw,int midpoint,
++    __local uint *contexts,__local uint *bits)
++{
++    uint lane=get_local_id(0);
++    for(int stripe=0;stripe<h;stripe+=4) {
++        int rows=min(4,h-stripe);
++        for(int base=0;base<w;base+=32) {
++            int x=base+lane;
++            for(int j=0;j<4;++j) {
++                uint context=0;
++                if(x<w && j<rows) {
++                    uint f=sample_flags(flags,x,stripe+j,w);
++                    if((f&(SIG|VISITED))==SIG)
++                        context=15+((f&REFINED)?2:(f&NEIGHBORS)?1:0);
++                }
++                contexts[4*lane+j]=context;
++            }
++            barrier(CLK_LOCAL_MEM_FENCE);
++            if(!lane) for(int i=0;i<128;++i) if(contexts[i])
++                bits[i]=raw?raw_decision(m,src,length):decision(m,src,length,contexts[i]-1);
++            barrier(CLK_LOCAL_MEM_FENCE);
++            if(x<w) {
++                uint refined=0;
++                for(int j=0;j<rows;++j) if(contexts[4*lane+j]) {
++                    int at=(stripe+j)*w+x;
++                    data[at]+=(bits[4*lane+j]^(data[at]<0))?midpoint:-midpoint;
++                    refined |= 1u<<(20+3*j);
++                }
++                flags[(stripe>>2)*w+x] |= refined;
++            }
++            barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);
++        }
++    }
++}
++
+ /* Descriptor: w,h,orientation,numbps,style,inputOffset,inputLength,
+  * segmentOffset,segmentCount,coefficientOffset,roiShift,checkPterm.
+  * Segments: length, passCount.
+  * Host verifies every range before upload; each block owns disjoint scratch.
+  */
+-__attribute__((reqd_work_group_size(1,1,1)))
++__attribute__((reqd_work_group_size(32,1,1)))
+ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *segments,
+                             __global const uchar *input, __global int *output,
+                             __local uint *flags, __global uint *status, uint count)
+ {
+-    size_t block = get_global_id(0);
++    size_t block = get_group_id(0);
++    uint lane=get_local_id(0);
++    __local uint prepared[128], decoded[128];
+     if (block >= count) return;
+     __global const uint *d = desc + block*12;
+     int w = d[0], h = d[1];
+     uint orient = d[2], style = d[4], offset = 0;
+     __global int *data = output + d[9];
+-    status[block] = 0;
++    if(!lane) status[block] = 0;
+     if (style & ~63u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30 || d[10] > 30 || d[3]+d[10] > 30) {
+-        status[block] = 1; return;
+-    }
+-    for (int i = 0; i < w*h; ++i) data[i] = 0;
+-    for (int i = 0; i < w*((h+3)/4); ++i) flags[i] = 0;
++        if(!lane) status[block] = 1; return;
++    }
++    for (int i = lane; i < w*h; i+=32) data[i] = 0;
++    for (int i = lane; i < w*((h+3)/4); i+=32) flags[i] = 0;
++    barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);
+     MQ m; reset_contexts(&m); m.synthesized = 0;
+     int bp = d[3]+d[10]; uint pass = 2, last_length = 0;
+     for (uint seg = 0; seg < d[8]; ++seg) {
+         uint2 s = segments[d[7]+seg];
+         last_length = s.x;
+-        if (offset > d[6] || s.x > d[6]-offset) { status[block] = 2; return; }
++        if (offset > d[6] || s.x > d[6]-offset) { if(!lane) status[block] = 2; return; }
+         __global const uchar *src = input + d[5] + offset;
+         offset += s.x;
+         uint raw = (style & 1) && bp <= (int)d[3]-4 && pass < 2;
+@@ -248,6 +289,8 @@
+         else init_segment(&m,src,s.x);
+         for (uint p = 0; p < s.y && bp >= 1; ++p) {
+             int midpoint = (1 << bp) >> 1, value = (1 << bp) | midpoint;
++            if(pass==1) refine_cooperative(&m,src,s.x,data,flags,w,h,raw,midpoint,prepared,decoded);
++            else if(!lane) {
+             /* The common 64x64/MQ path gives the compiler constant geometry,
+              * coding style and pass. Edge blocks and all other styles stay GPU. */
+             if (w==64 && h==64 && style==0) {
+@@ -258,7 +301,9 @@
+             else if (pass == 0) decode_pass(&m,src,s.x,data,flags,w,h,orient,style,0,raw,midpoint,value);
+             else if (pass == 1) decode_pass(&m,src,s.x,data,flags,w,h,orient,style,1,raw,midpoint,value);
+             else decode_pass(&m,src,s.x,data,flags,w,h,orient,style,2,0,midpoint,value);
+-            if (pass == 2) {
++            }
++            barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);
++            if (pass == 2 && !lane) {
+                 for (int i = 0; i < w*((h+3)/4); ++i) flags[i] &= ~PI_ALL;
+                 if (style & 32) {
+                     uint symbol = 0;
+@@ -268,17 +313,18 @@
+                     if (symbol != 10) status[block] |= 256;
+                 }
+             }
++            barrier(CLK_LOCAL_MEM_FENCE|CLK_GLOBAL_MEM_FENCE);
+             if ((style & 2) && !raw) reset_contexts(&m);
+             if (++pass == 3) { pass = 0; --bp; }
+         }
+     }
+-    if (d[11] && d[8]) {
++    if (!lane && d[11] && d[8]) {
+         if (m.pos + 2 < last_length) status[block] |= 512;
+         else if (m.synthesized > 2) status[block] |= 1024;
+     }
+     if (d[10]) {
+         int threshold = 1 << d[10];
+-        for (int i = 0; i < w*h; ++i) {
++        for (int i = lane; i < w*h; i+=32) {
+             int magnitude = abs(data[i]);
+             if (magnitude >= threshold) {
+                 magnitude >>= d[10];
+--- a/src/lib/openjp2/opencl_backend.c
++++ b/src/lib/openjp2/opencl_backend.c
+@@ -368,8 +368,8 @@
+ static int run(decode_worker *worker,cl_kernel k,size_t count)
+ {
+     cl_event event=NULL;
+-    size_t local=(k==worker->kernels[1] || k==worker->kernels[2])?64:1;
+-    if(local==64) count*=64;
++    size_t local=k==worker->kernels[0]?32:(k==worker->kernels[1] || k==worker->kernels[2])?64:1;
++    if(local>1) count*=local;
+     unsigned i;
+     if(!count) return 1;
+     if(fnEnqueueNDRangeKernel(worker->queue,k,1,NULL,&count,k!=worker->kernels[3]?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
+--- a/experimental/opencl/test_t1.py
++++ b/experimental/opencl/test_t1.py
+@@ -96,8 +96,8 @@
+                 cl.check(cl.SetKernelArg(kernel,index,local_bytes,None), "Tier-1 local scratch")
+                 continue
+             cl.check(cl.SetKernelArg(kernel, index, ct.sizeof(value), ct.byref(value)), "Tier-1 argument")
+-        shape = (SIZE * 1)(len(blocks) + 3)
+-        cl.check(cl.EnqueueNDRangeKernel(program.queue, kernel, 1, None, shape, (SIZE * 1)(1), 0, None, None), "Tier-1 dispatch")
++        shape = (SIZE * 1)((len(blocks) + 3)*32)
++        cl.check(cl.EnqueueNDRangeKernel(program.queue, kernel, 1, None, shape, (SIZE * 1)(32), 0, None, None), "Tier-1 dispatch")
+         for index in (3, 5):
+             data = arrays[index]
+             cl.check(cl.EnqueueReadBuffer(program.queue, buffers[index], 1, 0, ct.sizeof(data), data, 0, None, None), "Tier-1 readback")

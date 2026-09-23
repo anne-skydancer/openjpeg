@@ -60,7 +60,7 @@ def verify_batch(program, blocks):
     cl = program.cl
     desc, segments, reference = [], [], []
     payload = bytearray()
-    local_bytes=2*max(b["width"]*b["height"] for b in blocks)
+    local_bytes=4*max(b["width"]*((b["height"]+3)//4) for b in blocks)
     for b in blocks:
         desc.extend((b["width"], b["height"], b["orientation"], b["numbps"], b["style"],
                      len(payload), len(b["payload"]), len(segments)//2, len(b["segments"]), len(reference),
@@ -139,7 +139,10 @@ def main():
     directory = Path(__file__).resolve().parent
     if (directory / "mq_states.clh").read_text() != generate():
         raise RuntimeError("MQ table is stale; regenerate from upstream")
-    source = (directory / "mq_states.clh").read_bytes() + (directory / "t1_decode.cl").read_bytes()
+    from generate_context_tables import generate as generate_contexts
+    if (directory / "context_tables.clh").read_text() != generate_contexts():
+        raise RuntimeError("Context table is stale; regenerate from upstream")
+    source = b"".join((directory / name).read_bytes() for name in ("mq_states.clh", "context_tables.clh", "t1_decode.cl"))
     program = KernelProgram(cl, devices[0][0], source, (b"decode_blocks",))
     count = 0
     try:

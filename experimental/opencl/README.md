@@ -4,11 +4,12 @@ This branch starts at OpenJPEG **v2.5.4**, commit
 `6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an optional native
 OpenCL decoding backend without changing the public OpenJPEG API.
 
-**Status: experimental concurrent GPU backend.** On the qualified RX 9070 XT,
-four image workers deliver about **111 textures/s**, versus **49 textures/s**
-with one GPU worker. Four CPU image workers reach about **136 textures/s** on
-the same corpus. The GPU backend remains disabled by default; Vulkanstorm's
-package and shipping decoder have not been changed.
+**Status: experimental concurrent GPU backend with optimized Tier-1 decoding.**
+On the qualified RX 9070 XT, the latest paired GPU comparison measured about
+**138 textures/s with four image workers**, versus **114 before this change**;
+one worker improved from **52 to 61 textures/s**. These are warm codec throughput
+measurements, not viewer FPS. The backend remains disabled by default;
+Vulkanstorm's package and shipping decoder have not been changed.
 
 ## Decoding path
 
@@ -31,12 +32,18 @@ Buffer capacity across **all workers** stays within the 64 MiB aggregate cap;
 independent high-water marks cannot accumulate beyond it. Failed jobs drain the
 queue and discard their pooled buffers before freeing host staging.
 
-Tier-1 assigns one code block to each one-item work-group. Its significance and
-cardinal-sign flags fit in 16 bits per coefficient and reside in dynamically
-sized local memory (at most 8 KiB per group). Independent streams therefore do
-not share divergent instruction execution within a wave. Packed MQ contexts
-remain in private storage. Coefficients and compressed bytes stay in global
-memory; experiments moving these into local memory were slower.
+Tier-1 assigns one code block to each one-item work-group. Four vertically
+adjacent coefficients share one 32-bit significance/sign/refinement/visit word,
+following OpenJPEG's stripe layout. Flags reside in dynamically sized local
+memory: `width * ceil(height / 4) * 4` bytes, including partial stripes. A 64x64
+block uses 4 KiB rather than the previous 8 KiB. Independent streams therefore
+do not share divergent instruction execution within a wave. Context lookup
+tables come directly from upstream `t1_luts.h`; constant-pass calls and a
+64x64/style-zero fast path remove invariant choices from inner loops. Other
+block geometries and all 64 coding styles retain GPU decoding.
+
+Packed MQ contexts remain in private storage. Coefficients and compressed bytes
+stay in global memory; experiments moving these into local memory were slower.
 
 Placement and wavelet reconstruction use 64-item work-groups. Each wavelet group
 cooperates on one row or column, with barriers between dependent lifting phases
@@ -307,6 +314,62 @@ metadata and sample bytes; use neither option for throughput measurements.
 Remaining work includes improving entropy execution, evaluating cross-image
 batching, and qualification under rendering load, malformed/truncated input and
 device failure. Keep the backend opt-in until workload-level results justify it.
+
+## Within-block entropy experiments (2026-09-23)
+
+Implemented and correctness-tested all four proposed approaches, in sequence:
+
+1. **Packed four-row stripe state:** exact, but slower in isolation (27.153 ms
+   per texture in the initial one-worker screening versus 20.253 before).
+2. **Context lookup tables and specialization:** retained with packed state.
+   Tables recovered much of the initial loss; separate pass loops, packed
+   cleanup aggregation and a common 64x64/style-zero fast path produced the gain.
+3. **Cooperative refinement:** tested eight and 32 lanes. Each lane prepares
+   contexts and updates its own four-row column; lane zero advances MQ in exact
+   scan order. Three barriers per batch, none per decision. The 32-lane version
+   was the better candidate, but repeated runs did not favor it over scalar
+   specialization at one/four workers and were effectively tied at eight.
+4. **Two-decision speculative MQ lookahead:** tested both arithmetic exchange
+   paths and the subsequent refinement decision, committing only the actual
+   path. It remained exact but cost 20.693 ms per texture and 99.68 textures/s
+   at four workers in the initial screening. It is not active.
+
+The last two implementations are preserved as explicitly applied research
+[patches](variants/README.md), outside the compiled kernel bundle. This records
+negative results without paying their runtime cost or adding runtime selectors.
+
+The repeated comparison used the same 32 private cached textures, three trials,
+five warm corpus rounds per process: **480 measured images per table cell**, plus
+warmups. Each process used one CPU thread per image; GPU slot count matched the
+image-worker count. The middle trial reversed execution order. Every GPU tile
+count matched the total and all output checksums agreed. Baseline is `e8765369`.
+
+| Image workers | Previous GPU textures/s | Retained scalar textures/s | 32-lane refinement textures/s |
+| --- | ---: | ---: | ---: |
+| 1 | 51.86 (51.65-51.99) | **61.43 (61.06-61.85)** | 59.01 (56.08-60.89) |
+| 4 | 113.79 (107.61-118.67) | **138.01 (133.62-141.54)** | 134.79 (127.34-139.78) |
+| 8 | 123.48 (118.84-129.31) | **146.65 (142.38-153.26)** | 146.46 (140.43-150.40) |
+
+Parentheses show the range of process means. The retained implementation raises
+throughput by about **18.4%, 21.3% and 18.8%**, respectively. Timing varies between
+sessions; use these paired results rather than dividing by older table entries.
+This experiment does not establish a gain while the GPU is rendering the viewer.
+The default remains four slots and the aggregate device buffer cap remains 64 MiB.
+
+Each candidate passed all 29,184 captured blocks / 18,224,256 coefficients,
+including all 64 styles, 19,456 ROI blocks and 8,448 PTERM checks. Final validation:
+
+- Six native CTest tests passed; the expanded complete-image matrix covers
+  **168 cases / 404 component images**, including long one/three-row or column
+  images and partial stripes with large nominal code blocks.
+- **96 real-cache full/reduced decodes / 336 component images** were byte-exact.
+- Eight callers at 1/2/4/8 slots produced **384 exact real-cache GPU tile decodes**.
+- The rebuilt RelWithDebInfo shared DLL produced another **96 exact cached GPU
+  tile decodes** with profiling enabled, exited normally, and passed nested
+  decoding from a completion callback with one slot.
+
+Both static and shared RelWithDebInfo builds were rebuilt. Private texture
+payloads, reference pixels and benchmark executables remain in ignored `build/`.
 
 ## Provenance
 

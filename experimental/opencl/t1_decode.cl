@@ -42,8 +42,9 @@
  * MQ arithmetic and context semantics adapted from OpenJPEG v2.5.4.
  * Upstream copyright and license are retained in mq_states.clh.
  * Experimental Part 1 MQ/RAW path, ROI undo and PTERM diagnostics; no HT.
- * Each one-item work-group owns bounded local flags, avoiding global-memory
- * neighbor traffic and divergence between independent entropy streams.
+ * Each one-item work-group owns bounded packed stripe flags in local memory.
+ * Context tables and constant-pass/common-geometry specialization reduce the
+ * work per ordered MQ decision without changing the codestream.
  */
 typedef struct { uint a, c, ct, pos, synthesized; uint ctx0, ctx1, ctx2, ctx3, ctx4; } MQ;
 
@@ -115,58 +116,100 @@ uint decision(MQ *m, __global const uchar *src, uint length, uint context)
     } while (m->a < 0x8000);
     return bit;
 }
-/* Cache neighboring significance and sign bits per coefficient. A newly
- * significant sample updates adjacent contexts once, instead of each future
- * coding decision gathering eight separate global-memory neighbors.
- * Low 9 bits are a 3x3 significance map (self at bit 4); cardinal sign bits at 11..14.
- * VISITED=512, REFINED=1024. VSC suppresses northward propagation at stripe starts.
- */
-#define F(at) flags[(at)]
+/* Four-row stripe flags, following OpenJPEG's SIGMA/CHI/MU/PI layout.
+ * Bits 0..17: significance for three columns and six rows (with vertical halo).
+ * Bits 18,19,22,25,28,31: vertical sign samples, including the halo.
+ * Bits 20,23,26,29: refinement; 21,24,27,30: significance-pass visits.
+ * No padding words: boundary propagation is explicitly bounded. */
 #define SIG 16u
 #define VISITED 512u
 #define REFINED 1024u
 #define NEIGHBORS 495u
-int neighbors(__local const ushort *flags, int x, int y, int w, int h, uint style)
+#define PI_ALL ((1u<<21)|(1u<<24)|(1u<<27)|(1u<<30))
+/* Present the current row as significance (0..8), visited (9), refined (10). */
+uint sample_flags(__local const uint *flags,int x,int y,int w)
 {
-    return (F(y*w+x) & NEIGHBORS) != 0;
+    uint f=flags[(y>>2)*w+x] >> (3*(y&3));
+    return (f&511u) | ((f>>12)&512u) | ((f>>10)&1024u);
 }
-uint zero_context(__local const ushort *flags, int x, int y, int w, int h, uint orient, uint style)
+void mark_flag(__local uint *flags,int x,int y,int w,uint bit)
 {
-    uint f=F(y*w+x);
-    int hc=popcount(f & 40u), vc=popcount(f & 130u), dc=popcount(f & 325u);
-    if (orient == 1) { int t = hc; hc = vc; vc = t; }
-    if (orient == 3) {
-        int hv = hc + vc;
-        return dc == 0 ? (hv == 0 ? 0 : hv == 1 ? 1 : 2) :
-               dc == 1 ? (hv == 0 ? 3 : hv == 1 ? 4 : 5) :
-               dc == 2 ? (hv == 0 ? 6 : 7) : 8;
-    }
-    return hc == 0 ? (vc == 0 ? (dc == 0 ? 0 : dc == 1 ? 1 : 2) : vc == 1 ? 3 : 4) :
-           hc == 1 ? (vc == 0 ? (dc == 0 ? 5 : 6) : 7) : 8;
+    flags[(y>>2)*w+x] |= bit << (3*(y&3));
 }
-int sign_contribution(uint f,uint bit)
+int neighbors(__local const uint *flags, int x, int y, int w, int h, uint style)
 {
-    return (f & (1u<<bit)) ? ((f & (1u<<(11+(bit-1)/2))) ? -1 : 1) : 0;
+    return (sample_flags(flags,x,y,w) & NEIGHBORS) != 0;
+}
+uint zero_context(__local const uint *flags, int x, int y, int w, int h, uint orient, uint style)
+{
+    return lut_ctxno_zc[orient*512+(sample_flags(flags,x,y,w)&NEIGHBORS)];
 }
 void decode_sign(MQ *m, __global const uchar *src, uint length,
-                 __global int *data, __local ushort *flags,
+                 __global int *data, __local uint *flags,
                  int x, int y, int w, int h, int value, uint style, uint raw)
 {
-    uint f=F(y*w+x);
-    int hc=clamp(sign_contribution(f,3)+sign_contribution(f,5),-1,1);
-    int vc=clamp(sign_contribution(f,1)+sign_contribution(f,7),-1,1);
-    uint prediction = hc < 0 || (hc == 0 && vc < 0);
-    if (hc < 0) { hc = -hc; vc = -vc; }
-    uint context = 9 + (hc == 0 ? (vc == 0 ? 0 : 1) : vc == -1 ? 2 : vc == 0 ? 3 : 4);
+    uint f=sample_flags(flags,x,y,w), stripe=(y>>2)*w+x, row=y&3;
+    uint packed=flags[stripe], north=row ? 19+3*(row-1) : 18;
+    uint south=row<3 ? 19+3*(row+1) : 31;
+    uint signs=((packed>>north)&1u)<<11 | ((packed>>south)&1u)<<14;
+    if(x) signs |= ((flags[stripe-1]>>(19+3*row))&1u)<<12;
+    if(x+1<w) signs |= ((flags[stripe+1]>>(19+3*row))&1u)<<13;
+    f |= signs;
+    uint lu=(f&170u) | ((f>>12)&1u) | ((f>>11)&4u) | ((f>>7)&16u) | ((f>>8)&64u);
+    uint prediction=lut_spb[lu], context=lut_ctxno_sc[lu];
     uint sign = raw ? raw_decision(m,src,length) : decision(m,src,length,context) ^ prediction;
     data[y*w+x] = sign ? -value : value;
-    F(y*w+x) |= SIG;
-    for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx) {
-        int tx=x+dx,ty=y+dy;
-        if((dx==0 && dy==0) || tx<0 || tx>=w || ty<0 || ty>=h) continue;
-        if((style&8) && (y&3)==0 && dy==-1) continue;
-        uint bit=(1-dy)*3+(1-dx);
-        F(ty*w+tx) |= (1u<<bit) | ((bit&1) ? (sign<<(11+(bit-1)/2)) : 0u);
+    flags[stripe] |= sign << (19+3*row);
+    /* Propagate a single significance bit per neighbouring stripe column. */
+    for(int dx=-1;dx<=1;++dx) {
+        int tx=x+dx;
+        if(tx<0 || tx>=w) continue;
+        flags[(y>>2)*w+tx] |= 1u << (3*(row+1)+1-dx);
+        if(row==0 && y>0 && !(style&8))
+            flags[((y>>2)-1)*w+tx] |= 1u << (16-dx);
+        if(row==3 && y+1<h)
+            flags[((y>>2)+1)*w+tx] |= 1u << (1-dx);
+    }
+    if(row==0 && y>0 && !(style&8)) flags[stripe-w] |= sign<<31;
+    if(row==3 && y+1<h) flags[stripe+w] |= sign<<18;
+
+}
+
+/* Constant pass arguments remove pass dispatch from coefficient loops. */
+__attribute__((always_inline)) inline void decode_pass(MQ *m,
+    __global const uchar *src,uint length,__global int *data,__local uint *flags,
+    int w,int h,uint orient,uint style,uint pass,uint raw,int midpoint,int value)
+{
+    for (int stripe = 0; stripe < h; stripe += 4) {
+        int rows = min(4,h-stripe);
+        for (int x = 0; x < w; ++x) {
+            int start = 0, forced = 0;
+            if (pass == 2 && rows == 4) {
+                int aggregate = !(flags[(stripe>>2)*w+x] & (0x3ffffu|PI_ALL));
+                if (aggregate) {
+                    if (!decision(m,src,length,17)) continue;
+                    start = (int)decision(m,src,length,18) << 1;
+                    start |= decision(m,src,length,18); forced = 1;
+                }
+            }
+            for (int j = start; j < rows; ++j) {
+                int y = stripe+j, at = y*w+x;
+                if (pass == 1) {
+                    if ((sample_flags(flags,x,y,w) & (SIG|VISITED)) == SIG) {
+                        uint context = 14 + ((sample_flags(flags,x,y,w) & REFINED) ? 2 : neighbors(flags,x,y,w,h,style) ? 1 : 0);
+                        uint bit = raw ? raw_decision(m,src,length) : decision(m,src,length,context);
+                        data[at] += (bit ^ (data[at] < 0)) ? midpoint : -midpoint;
+                        mark_flag(flags,x,y,w,1u<<20);
+                    }
+                } else if (!(sample_flags(flags,x,y,w) & (SIG|VISITED))) {
+                    if (pass == 0 && !neighbors(flags,x,y,w,h,style)) continue;
+                    uint bit = forced ? 1 : raw ? raw_decision(m,src,length) : decision(m,src,length,zero_context(flags,x,y,w,h,orient,style));
+                    forced = 0;
+                    if (bit) decode_sign(m,src,length,data,flags,x,y,w,h,value,style,raw);
+                    if (pass == 0) mark_flag(flags,x,y,w,1u<<21);
+                }
+            }
+        }
     }
 }
 
@@ -178,7 +221,7 @@ void decode_sign(MQ *m, __global const uchar *src, uint length,
 __attribute__((reqd_work_group_size(1,1,1)))
 __kernel void decode_blocks(__global const uint *desc, __global const uint2 *segments,
                             __global const uchar *input, __global int *output,
-                            __local ushort *flags, __global uint *status, uint count)
+                            __local uint *flags, __global uint *status, uint count)
 {
     size_t block = get_global_id(0);
     if (block >= count) return;
@@ -190,7 +233,8 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
     if (style & ~63u || w <= 0 || h <= 0 || w*h > 4096 || orient > 3 || d[3] > 30 || d[10] > 30 || d[3]+d[10] > 30) {
         status[block] = 1; return;
     }
-    for (int i = 0; i < w*h; ++i) { data[i] = 0; F(i) = 0; }
+    for (int i = 0; i < w*h; ++i) data[i] = 0;
+    for (int i = 0; i < w*((h+3)/4); ++i) flags[i] = 0;
     MQ m; reset_contexts(&m); m.synthesized = 0;
     int bp = d[3]+d[10]; uint pass = 2, last_length = 0;
     for (uint seg = 0; seg < d[8]; ++seg) {
@@ -204,41 +248,18 @@ __kernel void decode_blocks(__global const uint *desc, __global const uint2 *seg
         else init_segment(&m,src,s.x);
         for (uint p = 0; p < s.y && bp >= 1; ++p) {
             int midpoint = (1 << bp) >> 1, value = (1 << bp) | midpoint;
-            for (int stripe = 0; stripe < h; stripe += 4) {
-                int rows = min(4,h-stripe);
-                for (int x = 0; x < w; ++x) {
-                    int start = 0, forced = 0;
-                    if (pass == 2 && rows == 4) {
-                        int aggregate = 1;
-                        for (int j = 0; j < 4; ++j)
-                            if ((F((stripe+j)*w+x) & (SIG|VISITED)) || neighbors(flags,x,stripe+j,w,h,style)) aggregate = 0;
-                        if (aggregate) {
-                            if (!decision(&m,src,s.x,17)) continue;
-                            start = (int)decision(&m,src,s.x,18) << 1;
-                            start |= decision(&m,src,s.x,18); forced = 1;
-                        }
-                    }
-                    for (int j = start; j < rows; ++j) {
-                        int y = stripe+j, at = y*w+x;
-                        if (pass == 1) {
-                            if ((F(at) & (SIG|VISITED)) == SIG) {
-                                uint context = 14 + ((F(at) & REFINED) ? 2 : neighbors(flags,x,y,w,h,style) ? 1 : 0);
-                                uint bit = raw ? raw_decision(&m,src,s.x) : decision(&m,src,s.x,context);
-                                data[at] += (bit ^ (data[at] < 0)) ? midpoint : -midpoint;
-                                F(at) |= REFINED;
-                            }
-                        } else if (!(F(at) & (SIG|VISITED))) {
-                            if (pass == 0 && !neighbors(flags,x,y,w,h,style)) continue;
-                            uint bit = forced ? 1 : raw ? raw_decision(&m,src,s.x) : decision(&m,src,s.x,zero_context(flags,x,y,w,h,orient,style));
-                            forced = 0;
-                            if (bit) decode_sign(&m,src,s.x,data,flags,x,y,w,h,value,style,raw);
-                            if (pass == 0) F(at) |= VISITED;
-                        }
-                    }
-                }
+            /* The common 64x64/MQ path gives the compiler constant geometry,
+             * coding style and pass. Edge blocks and all other styles stay GPU. */
+            if (w==64 && h==64 && style==0) {
+                if (pass==0) decode_pass(&m,src,s.x,data,flags,64,64,orient,0,0,0,midpoint,value);
+                else if (pass==1) decode_pass(&m,src,s.x,data,flags,64,64,orient,0,1,0,midpoint,value);
+                else decode_pass(&m,src,s.x,data,flags,64,64,orient,0,2,0,midpoint,value);
             }
+            else if (pass == 0) decode_pass(&m,src,s.x,data,flags,w,h,orient,style,0,raw,midpoint,value);
+            else if (pass == 1) decode_pass(&m,src,s.x,data,flags,w,h,orient,style,1,raw,midpoint,value);
+            else decode_pass(&m,src,s.x,data,flags,w,h,orient,style,2,0,midpoint,value);
             if (pass == 2) {
-                for (int i = 0; i < w*h; ++i) F(i) &= ~VISITED;
+                for (int i = 0; i < w*((h+3)/4); ++i) flags[i] &= ~PI_ALL;
                 if (style & 32) {
                     uint symbol = 0;
                     for (int i = 0; i < 4; ++i) symbol = (symbol << 1) | decision(&m,src,s.x,18);
