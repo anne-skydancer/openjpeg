@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  * Opt-in experimental synchronous OpenCL backend. No OpenCL link dependency:
  * the installed ICD is loaded only when OPJ_OPENCL_DEVICE is explicitly set.
- * Unsupported input, contention, allocation refusal and errors use CPU decoding.
+ * Unsupported input, allocation refusal and errors use CPU decoding.
+ * Eligible concurrent calls share bounded worker slots and wait for admission.
  */
 #define OPJ_SKIP_POISON
 #include "opj_includes.h"
@@ -12,7 +13,10 @@
 #ifdef _WIN32
 #include <windows.h>
 static SRWLOCK cl_lock = SRWLOCK_INIT;
-#define LOCK() TryAcquireSRWLockExclusive(&cl_lock)
+static CONDITION_VARIABLE cl_available = CONDITION_VARIABLE_INIT;
+#define LOCK() AcquireSRWLockExclusive(&cl_lock)
+#define WAIT() SleepConditionVariableSRW(&cl_available,&cl_lock,INFINITE,0)
+#define WAKE() WakeAllConditionVariable(&cl_available)
 #define UNLOCK() ReleaseSRWLockExclusive(&cl_lock)
 #define LIB_OPEN() LoadLibraryExW(L"OpenCL.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32)
 #define SYMBOL(h,n) GetProcAddress((HMODULE)(h),(n))
@@ -20,7 +24,10 @@ static SRWLOCK cl_lock = SRWLOCK_INIT;
 #include <dlfcn.h>
 #include <pthread.h>
 static pthread_mutex_t cl_lock = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK() (pthread_mutex_trylock(&cl_lock) == 0)
+static pthread_cond_t cl_available = PTHREAD_COND_INITIALIZER;
+#define LOCK() pthread_mutex_lock(&cl_lock)
+#define WAIT() (pthread_cond_wait(&cl_available,&cl_lock) == 0)
+#define WAKE() pthread_cond_broadcast(&cl_available)
 #define UNLOCK() pthread_mutex_unlock(&cl_lock)
 #define LIB_OPEN() dlopen("libOpenCL.so.1", RTLD_NOW | RTLD_LOCAL)
 #define SYMBOL(h,n) dlsym((h),(n))
@@ -56,54 +63,76 @@ DECL(cl_int,ReleaseContext,(cl_context));
 DECL(cl_int,GetEventProfilingInfo,(cl_event,cl_profiling_info,size_t,void*,size_t*));
 DECL(cl_int,ReleaseEvent,(cl_event));
 
-static struct {
-    void *library;
-    int attempted;
-    cl_context context;
+#define BUDGET (64u*1024u*1024u)
+#define MAX_WORKERS 8
+/* A leased slot has exclusive ownership of mutable arguments, queue and buffers.
+ * Context/program/device are immutable once initialization completes. */
+typedef struct {
+    int busy;
+    unsigned admitted_active;
+    OPJ_UINT64 admitted_bytes;
     cl_command_queue queue;
-    cl_program program;
     cl_kernel kernels[4];
-    char selector[256], driver[256];
     cl_mem buffers[8];
     size_t capacities[8];
-    int profiling;
     cl_event events[260];
     unsigned stages[260], event_count;
+} decode_worker;
+
+static struct {
+    void *library;
+    int attempted, profiling;
+    cl_context context;
+    cl_device_id device;
+    cl_program program;
+    char selector[256], driver[256];
+    unsigned worker_count;
+    decode_worker workers[MAX_WORKERS];
 } runtime;
 
-static void release_buffers(void)
+/* Called only under the admission lock, or during process teardown. */
+static void release_buffers(decode_worker *worker)
 {
     unsigned i;
     for(i=0;i<8;i++) {
-        if(runtime.buffers[i]) fnReleaseMemObject(runtime.buffers[i]);
-        runtime.buffers[i]=NULL; runtime.capacities[i]=0;
+        if(worker->buffers[i]) fnReleaseMemObject(worker->buffers[i]);
+        worker->buffers[i]=NULL; worker->capacities[i]=0;
     }
+}
+
+static void destroy_worker(decode_worker *worker)
+{
+    unsigned i;
+    if(worker->queue) fnFinish(worker->queue);
+    release_buffers(worker);
+    for(i=0;i<4;i++) if(worker->kernels[i]) {
+        fnReleaseKernel(worker->kernels[i]); worker->kernels[i]=NULL;
+    }
+    if(worker->queue) { fnReleaseCommandQueue(worker->queue); worker->queue=NULL; }
 }
 
 static void destroy_runtime(void)
 {
-    int i;
-    if (runtime.queue) fnFinish(runtime.queue);
-    release_buffers();
-    for (i=0;i<4;i++) if (runtime.kernels[i]) {
-        fnReleaseKernel(runtime.kernels[i]); runtime.kernels[i]=NULL;
-    }
-    if (runtime.program) { fnReleaseProgram(runtime.program); runtime.program=NULL; }
-    if (runtime.queue) { fnReleaseCommandQueue(runtime.queue); runtime.queue=NULL; }
-    if (runtime.context) { fnReleaseContext(runtime.context); runtime.context=NULL; }
+    unsigned i;
+    for(i=0;i<MAX_WORKERS;i++) destroy_worker(&runtime.workers[i]);
+    if(runtime.program) { fnReleaseProgram(runtime.program); runtime.program=NULL; }
+    if(runtime.context) { fnReleaseContext(runtime.context); runtime.context=NULL; }
     /* Keep the ICD module loaded until process teardown. */
 }
 
-static OPJ_BOOL initialize(const char *selector, const char *driver, opj_event_mgr_t *manager)
+static OPJ_BOOL initialize(const char *selector, const char *driver, char *warning, size_t warning_size)
 {
     cl_platform_id platforms[32];
     cl_device_id devices[32], selected=NULL;
     cl_uint np=0, nd=0, p, d, matches=0;
     cl_int error;
-    const char *names[4]={"decode_blocks","place_blocks","inverse_line","finish_pixels"};
-    unsigned i;
+    const char *workers=getenv("OPJ_OPENCL_WORKERS");
+    char *end=NULL;
+    long count=workers?strtol(workers,&end,10):4;
     if (runtime.attempted) return runtime.context && !strcmp(selector,runtime.selector) && !strcmp(driver,runtime.driver);
     runtime.attempted=1;
+    if(count<1 || count>MAX_WORKERS || (workers && (!*workers || *end))) return OPJ_FALSE;
+    runtime.worker_count=(unsigned)count;
     if (strlen(selector)>=sizeof(runtime.selector) || strlen(driver)>=sizeof(runtime.driver)) return OPJ_FALSE;
     strcpy(runtime.selector,selector); strcpy(runtime.driver,driver);
     runtime.library=(void*)LIB_OPEN();
@@ -125,35 +154,122 @@ static OPJ_BOOL initialize(const char *selector, const char *driver, opj_event_m
         }
     }
     if (matches!=1) {
-        opj_event_msg(manager,EVT_WARNING,"OpenCL selector matched %u GPUs; using CPU\n",matches);
+        snprintf(warning,warning_size,"OpenCL selector matched %u GPUs; using CPU\n",matches);
         return OPJ_FALSE;
     }
     runtime.context=fnCreateContext(NULL,1,&selected,NULL,NULL,&error);
     if (!runtime.context || error) goto fail;
     runtime.profiling=getenv("OPJ_OPENCL_PROFILE")!=NULL;
-    runtime.queue=fnCreateCommandQueue(runtime.context,selected,runtime.profiling?CL_QUEUE_PROFILING_ENABLE:0,&error);
-    if (!runtime.queue || error) goto fail;
+    runtime.device=selected;
     runtime.program=fnCreateProgramWithSource(runtime.context,3,(const char**)opj_cl_sources,NULL,&error);
     if (!runtime.program || error) goto fail;
     error=fnBuildProgram(runtime.program,1,&selected,"-cl-std=CL1.2",NULL,NULL);
     if (error) {
         char log[8192]={0};
         fnGetProgramBuildInfo(runtime.program,selected,CL_PROGRAM_BUILD_LOG,sizeof(log)-1,log,NULL);
-        opj_event_msg(manager,EVT_WARNING,"OpenCL kernel compilation failed: %s\n",log);
+        snprintf(warning,warning_size,"OpenCL kernel compilation failed: %s\n",log);
         goto fail;
     }
-    for (i=0;i<4;i++) {
-        runtime.kernels[i]=fnCreateKernel(runtime.program,names[i],&error);
-        if (!runtime.kernels[i] || error) goto fail;
+#if defined(_WIN32) && defined(OPJ_EXPORTS)
+    {
+        HMODULE module;
+        /* DLL atexit handlers run during CRT detach under the loader lock.
+         * Calling a GPU driver there can deadlock. This optional runtime is
+         * process-lived: pin its owning module and let process teardown reclaim
+         * the context. Pinning also prevents unload/reload from duplicating it.
+         * Static builds can safely release it before EXE CRT termination. */
+        if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_PIN,
+                              (LPCWSTR)(const void*)&runtime,&module)) goto fail;
     }
+#else
     atexit(destroy_runtime);
+#endif
     return OPJ_TRUE;
 fail:
     destroy_runtime();
     return OPJ_FALSE;
 }
 
-#define BUDGET (64u*1024u*1024u)
+/* Admission is the only serialized part. Waiting releases the lock; a job
+ * never holds it while uploading, decoding, reading back or invoking callbacks.
+ * Idle capacity may be reclaimed, but active buffers are never touched. */
+static decode_worker *acquire_worker(const char *selector,const char *driver,
+                                     const size_t sizes[8],opj_event_mgr_t *manager)
+{
+    decode_worker *worker=NULL;
+    char warning[8448]={0};
+    unsigned i,j;
+    cl_int error;
+    const char *names[4]={"decode_blocks","place_blocks","inverse_line","finish_pixels"};
+    LOCK();
+    if(!initialize(selector,driver,warning,sizeof(warning))) goto fail;
+    for(;;) {
+        OPJ_UINT64 capacity=0;
+        worker=NULL;
+        for(i=0;i<runtime.worker_count;i++) if(!runtime.workers[i].busy) {
+            worker=&runtime.workers[i]; break;
+        }
+        if(worker) {
+            for(i=0;i<runtime.worker_count;i++) for(j=0;j<8;j++) {
+                size_t n=runtime.workers[i].capacities[j];
+                if(&runtime.workers[i]==worker && sizes[j]>n) n=sizes[j];
+                capacity+=n;
+            }
+            if(capacity>BUDGET) {
+                capacity=0;
+                for(i=0;i<runtime.worker_count;i++) {
+                    decode_worker *other=&runtime.workers[i];
+                    if(!other->busy) release_buffers(other);
+                    for(j=0;j<8;j++) capacity+=other->capacities[j];
+                }
+                for(j=0;j<8;j++) capacity+=sizes[j];
+            }
+            if(capacity<=BUDGET) break;
+        }
+        if(!WAIT()) { worker=NULL; goto fail; }
+    }
+    if(!worker->queue) {
+        worker->queue=fnCreateCommandQueue(runtime.context,runtime.device,
+                            runtime.profiling?CL_QUEUE_PROFILING_ENABLE:0,&error);
+        if(!worker->queue || error) goto fail;
+        for(i=0;i<4;i++) {
+            worker->kernels[i]=fnCreateKernel(runtime.program,names[i],&error);
+            if(!worker->kernels[i] || error) goto fail;
+        }
+    }
+    for(i=0;i<8;i++) if(worker->capacities[i]<sizes[i]) {
+        if(worker->buffers[i]) fnReleaseMemObject(worker->buffers[i]);
+        worker->capacities[i]=0;
+        worker->buffers[i]=fnCreateBuffer(runtime.context,CL_MEM_READ_WRITE,sizes[i],NULL,&error);
+        if(!worker->buffers[i] || error) goto fail;
+        worker->capacities[i]=sizes[i];
+    }
+    worker->busy=1;
+    worker->admitted_active=0; worker->admitted_bytes=0;
+    for(i=0;i<runtime.worker_count;i++) {
+        worker->admitted_active+=runtime.workers[i].busy?1:0;
+        for(j=0;j<8;j++) worker->admitted_bytes+=runtime.workers[i].capacities[j];
+    }
+    UNLOCK();
+    return worker;
+fail:
+    if(worker) destroy_worker(worker);
+    WAKE();
+    UNLOCK();
+    if(*warning) opj_event_msg(manager,EVT_WARNING,"%s",warning);
+    return NULL;
+}
+
+static void release_worker(decode_worker *worker,OPJ_BOOL success)
+{
+    LOCK();
+    if(!success) release_buffers(worker);
+    worker->busy=0;
+    WAKE();
+    UNLOCK();
+}
+
 typedef struct {
     OPJ_UINT32 blocks, segments, bytes, coefficients, max_block_samples;
     OPJ_UINT32 *desc, *segs, *place, *status;
@@ -248,19 +364,19 @@ static OPJ_BOOL plan_blocks(opj_tcd_t *tcd, decode_plan *p, OPJ_UINT32 stride,
 
 static int arg(cl_kernel k,cl_uint index,size_t size,const void *value)
 { return fnSetKernelArg(k,index,size,value)==CL_SUCCESS; }
-static int run(cl_kernel k,size_t count)
+static int run(decode_worker *worker,cl_kernel k,size_t count)
 {
     cl_event event=NULL;
-    size_t local=(k==runtime.kernels[1] || k==runtime.kernels[2])?64:1;
+    size_t local=(k==worker->kernels[1] || k==worker->kernels[2])?64:1;
     if(local==64) count*=64;
     unsigned i;
     if(!count) return 1;
-    if(fnEnqueueNDRangeKernel(runtime.queue,k,1,NULL,&count,k!=runtime.kernels[3]?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
+    if(fnEnqueueNDRangeKernel(worker->queue,k,1,NULL,&count,k!=worker->kernels[3]?&local:NULL,0,NULL,runtime.profiling?&event:NULL)) return 0;
     if(event) {
-        if(runtime.event_count>=260) { fnReleaseEvent(event); return 0; }
-        for(i=0;i<4;i++) if(k==runtime.kernels[i]) break;
-        runtime.stages[runtime.event_count]=i;
-        runtime.events[runtime.event_count++]=event;
+        if(worker->event_count>=260) { fnReleaseEvent(event); return 0; }
+        for(i=0;i<4;i++) if(k==worker->kernels[i]) break;
+        worker->stages[worker->event_count]=i;
+        worker->events[worker->event_count++]=event;
     }
     return 1;
 }
@@ -277,7 +393,12 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     OPJ_UINT32 precision=tcd->image->comps[0].prec,sgnd=tcd->image->comps[0].sgnd;
     OPJ_INT32 shift=coding->m_dc_level_shift;
     OPJ_UINT64 total,budget;
-    OPJ_BOOL success=OPJ_FALSE,locked=OPJ_FALSE;
+    OPJ_BOOL success=OPJ_FALSE;
+    decode_worker *worker=NULL;
+    unsigned completed_slot=0, admitted_active=0;
+    OPJ_UINT64 admitted_bytes=0;
+    double profile_ms[4]={0};
+    OPJ_BOOL have_profile=OPJ_FALSE;
     decode_plan p={0};
     /* desc, segments, input, coefficients, status, placement, scale, planes */
     cl_mem mem[8]={0};
@@ -285,7 +406,6 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     void *host[8]={0};
     OPJ_INT32 *result=NULL;
     cl_kernel kernel;
-    cl_int error=CL_SUCCESS;
     if(!selector || !*selector || !tcd->whole_tile_decoding || tcd->used_component ||
             components<1 || components>4 || !levels || levels>33 || mct>1 ||
             (mct && components<3) || precision<1 || precision>16 || rev>1) return OPJ_FALSE;
@@ -307,8 +427,6 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
             if(a->x0!=b->x0 || a->x1!=b->x1 || a->y0!=b->y0 || a->y1!=b->y1) return OPJ_FALSE;
         }
     }
-    if(!LOCK()) return OPJ_FALSE;
-    locked=OPJ_TRUE;
     if(!plan_blocks(tcd,&p,width,samples,components,0)) goto cleanup;
     sizes[0]=(size_t)p.blocks*12*4; sizes[1]=opj_uint_max(1,p.segments)*2*4;
     sizes[2]=opj_uint_max(1,p.bytes); sizes[3]=(size_t)p.coefficients*4;
@@ -316,7 +434,9 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     sizes[5]=(size_t)p.blocks*4*4; sizes[6]=(size_t)p.blocks*4;
     sizes[7]=(size_t)total*4;
     budget=0;for(i=0;i<8;i++) budget+=sizes[i];
-    if(budget>BUDGET || !initialize(selector,driver,manager)) goto cleanup;
+    if(budget>BUDGET) goto cleanup;
+    worker=acquire_worker(selector,driver,sizes,manager);
+    if(!worker) goto cleanup;
     p.desc=(OPJ_UINT32*)opj_malloc(sizes[0]);p.segs=(OPJ_UINT32*)opj_calloc(1,sizes[1]);
     p.input=(OPJ_BYTE*)opj_calloc(1,sizes[2]);p.status=(OPJ_UINT32*)opj_malloc(sizes[4]);
     p.place=(OPJ_UINT32*)opj_malloc(sizes[5]);p.scale=(float*)opj_malloc(sizes[6]);
@@ -324,35 +444,22 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
     if(!p.desc||!p.segs||!p.input||!p.status||!p.place||!p.scale||!result) goto cleanup;
     if(!plan_blocks(tcd,&p,width,samples,components,1)) goto cleanup;
     host[0]=p.desc;host[1]=p.segs;host[2]=p.input;host[5]=p.place;host[6]=p.scale;host[7]=result;
-    /* Reuse device allocations without allowing independent high-water marks
-     * to grow beyond the same aggregate working budget. Host writes remain
-     * alive until the cleanup fence, including every failure path. */
-    budget=0;
-    for(i=0;i<8;i++) budget+=sizes[i]>runtime.capacities[i]?sizes[i]:runtime.capacities[i];
-    if(budget>BUDGET) release_buffers();
+    /* Host staging outlives every asynchronous write, including errors. */
     for(i=0;i<8;i++) {
-        if(!sizes[i]) continue;
-        if(runtime.capacities[i]<sizes[i]) {
-            if(runtime.buffers[i]) fnReleaseMemObject(runtime.buffers[i]);
-            runtime.capacities[i]=0;
-            runtime.buffers[i]=fnCreateBuffer(runtime.context,CL_MEM_READ_WRITE,sizes[i],NULL,&error);
-            if(!runtime.buffers[i] || error) goto cleanup;
-            runtime.capacities[i]=sizes[i];
-        }
-        mem[i]=runtime.buffers[i];
-        if(host[i] && fnEnqueueWriteBuffer(runtime.queue,mem[i],CL_FALSE,0,sizes[i],host[i],0,NULL,NULL)) goto cleanup;
+        mem[i]=worker->buffers[i];
+        if(host[i] && fnEnqueueWriteBuffer(worker->queue,mem[i],CL_FALSE,0,sizes[i],host[i],0,NULL,NULL)) goto cleanup;
     }
-    kernel=runtime.kernels[0];
+    kernel=worker->kernels[0];
     for(i=0;i<4;i++) { ARG(kernel,i,mem[i]); }
     ARG(kernel,5,mem[4]);
     if(!arg(kernel,4,(size_t)p.max_block_samples*2,NULL)) goto cleanup;
     ARG(kernel,6,p.blocks);
-    if(!run(kernel,p.blocks)) goto cleanup;
-    kernel=runtime.kernels[1];
+    if(!run(worker,kernel,p.blocks)) goto cleanup;
+    kernel=worker->kernels[1];
     ARG(kernel,0,mem[0]);ARG(kernel,1,mem[5]);ARG(kernel,2,mem[6]);ARG(kernel,3,mem[3]);
     ARG(kernel,4,mem[7]);ARG(kernel,5,p.blocks);ARG(kernel,6,rev);
-    if(!run(kernel,p.blocks)) goto cleanup;
-    kernel=runtime.kernels[2];
+    if(!run(worker,kernel,p.blocks)) goto cleanup;
+    kernel=worker->kernels[2];
     ARG(kernel,0,mem[7]);ARG(kernel,3,width);ARG(kernel,9,rev);
     if(!arg(kernel,1,(size_t)opj_uint_max(width,height)*4,NULL)) goto cleanup;
     for(c=0;c<components;c++) {
@@ -363,42 +470,53 @@ OPJ_BOOL opj_opencl_decode_tile(opj_tcd_t *tcd,opj_event_mgr_t *manager)
             OPJ_UINT32 rw=res->x1-res->x0,rh=res->y1-res->y0;
             OPJ_UINT32 low=prev->x1-prev->x0,parity=res->x0&1,vertical=0;
             ARG(kernel,4,rw);ARG(kernel,5,rh);ARG(kernel,6,low);ARG(kernel,7,parity);ARG(kernel,8,vertical);
-            if(!run(kernel,rh)) goto cleanup;
+            if(!run(worker,kernel,rh)) goto cleanup;
             low=prev->y1-prev->y0;parity=res->y0&1;vertical=1;
             ARG(kernel,4,rh);ARG(kernel,5,rw);ARG(kernel,6,low);ARG(kernel,7,parity);ARG(kernel,8,vertical);
-            if(!run(kernel,rw)) goto cleanup;
+            if(!run(worker,kernel,rw)) goto cleanup;
         }
     }
-    kernel=runtime.kernels[3];
+    kernel=worker->kernels[3];
     ARG(kernel,0,mem[7]);ARG(kernel,1,samples);ARG(kernel,2,components);ARG(kernel,3,mct);
     ARG(kernel,4,rev);ARG(kernel,5,precision);ARG(kernel,6,sgnd);ARG(kernel,7,shift);
-    if(!run(kernel,samples)) goto cleanup;
-    if(fnEnqueueReadBuffer(runtime.queue,mem[4],CL_FALSE,0,sizes[4],p.status,0,NULL,NULL)) goto cleanup;
-    if(fnEnqueueReadBuffer(runtime.queue,mem[7],CL_TRUE,0,sizes[7],result,0,NULL,NULL)) goto cleanup;
+    if(!run(worker,kernel,samples)) goto cleanup;
+    if(fnEnqueueReadBuffer(worker->queue,mem[4],CL_FALSE,0,sizes[4],p.status,0,NULL,NULL)) goto cleanup;
+    if(fnEnqueueReadBuffer(worker->queue,mem[7],CL_TRUE,0,sizes[7],result,0,NULL,NULL)) goto cleanup;
     for(i=0;i<p.blocks;i++) {
         if(p.status[i]&255) goto cleanup;
-        if(p.status[i]&1536) opj_event_msg(manager,EVT_WARNING,"OpenCL PTERM diagnostic %u\n",p.status[i]&1536);
     }
 
     for(c=0;c<components;c++) memcpy(tile->comps[c].data,result+c*samples,(size_t)samples*4);
     success=OPJ_TRUE;
-    opj_event_msg(manager,EVT_INFO,"OpenCL decoded tile %u (%u blocks)\n",tcd->tcd_tileno,p.blocks);
 cleanup:
-    if(runtime.queue && locked) fnFinish(runtime.queue);
-    if(locked && runtime.event_count) {
-        double ms[4]={0};
-        for(i=0;i<runtime.event_count;i++) {
+    if(worker && worker->queue) fnFinish(worker->queue);
+    if(worker && worker->event_count) {
+        have_profile=OPJ_TRUE;
+        for(i=0;i<worker->event_count;i++) {
             cl_ulong begin=0,end=0;
-            if(fnGetEventProfilingInfo(runtime.events[i],CL_PROFILING_COMMAND_START,sizeof(begin),&begin,NULL)==CL_SUCCESS &&
-               fnGetEventProfilingInfo(runtime.events[i],CL_PROFILING_COMMAND_END,sizeof(end),&end,NULL)==CL_SUCCESS &&
-               runtime.stages[i]<4) ms[runtime.stages[i]]+=(end-begin)/1000000.0;
-            fnReleaseEvent(runtime.events[i]);
+            if(fnGetEventProfilingInfo(worker->events[i],CL_PROFILING_COMMAND_START,sizeof(begin),&begin,NULL)==CL_SUCCESS &&
+               fnGetEventProfilingInfo(worker->events[i],CL_PROFILING_COMMAND_END,sizeof(end),&end,NULL)==CL_SUCCESS &&
+               worker->stages[i]<4) profile_ms[worker->stages[i]]+=(end-begin)/1000000.0;
+            fnReleaseEvent(worker->events[i]);
         }
-        runtime.event_count=0;
-        opj_event_msg(manager,EVT_INFO,"OpenCL timings: T1 %.3f place %.3f DWT %.3f finish %.3f ms\n",ms[0],ms[1],ms[2],ms[3]);
+        worker->event_count=0;
     }
-    if(locked && !success) release_buffers();
+    if(worker) {
+        completed_slot=(unsigned)(worker-runtime.workers);
+        admitted_active=worker->admitted_active; admitted_bytes=worker->admitted_bytes;
+        release_worker(worker,success);
+    }
+    /* User callbacks may invoke another decoder. Return the slot first so a
+     * nested decode cannot wait on a lease held by its own callback. */
+    if(success) {
+        for(i=0;i<p.blocks;i++) if(p.status[i]&1536)
+            opj_event_msg(manager,EVT_WARNING,"OpenCL PTERM diagnostic %u\n",p.status[i]&1536);
+        opj_event_msg(manager,EVT_INFO,"OpenCL decoded tile %u (%u blocks) worker %u active %u pooled %llu\n",
+                      tcd->tcd_tileno,p.blocks,completed_slot,admitted_active,(unsigned long long)admitted_bytes);
+    }
+    if(have_profile)
+        opj_event_msg(manager,EVT_INFO,"OpenCL timings: T1 %.3f place %.3f DWT %.3f finish %.3f ms\n",
+                      profile_ms[0],profile_ms[1],profile_ms[2],profile_ms[3]);
     free_plan(&p);opj_free(result);
-    if(locked) UNLOCK();
     return success;
 }

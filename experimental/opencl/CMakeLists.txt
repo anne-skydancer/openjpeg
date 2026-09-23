@@ -3,6 +3,15 @@ add_executable(bench_decode bench_decode.c)
 target_include_directories(bench_decode PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
   "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
 target_link_libraries(bench_decode openjp2)
+find_package(Threads REQUIRED)
+add_executable(bench_workers bench_workers.c)
+target_include_directories(bench_workers PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
+  "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
+target_link_libraries(bench_workers openjp2 Threads::Threads)
+add_executable(test_opencl_reentrant test_reentrant.c)
+target_include_directories(test_opencl_reentrant PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2"
+  "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
+target_link_libraries(test_opencl_reentrant openjp2)
 option(OPJ_CAPTURE_T1_REFERENCES "Enable development-only Tier-1 reference capture" OFF)
 if(OPJ_CAPTURE_T1_REFERENCES)
   target_compile_definitions(openjp2 PRIVATE OPJ_CAPTURE_T1_REFERENCES)
@@ -39,6 +48,11 @@ if(OPJ_ENABLE_OPENCL AND BUILD_CODEC)
       --bin "$<TARGET_FILE_DIR:bench_decode>" --out "${CMAKE_CURRENT_BINARY_DIR}/reuse"
       --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
   set_tests_properties(opencl_reuse PROPERTIES LABELS "experimental;opencl" TIMEOUT 120 RUN_SERIAL TRUE)
+  add_test(NAME opencl_workers
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_workers.py"
+      --bin "$<TARGET_FILE_DIR:bench_workers>" --out "${CMAKE_CURRENT_BINARY_DIR}/workers"
+      --device "${OPJ_OPENCL_TEST_DEVICE}" ${driver_args})
+  set_tests_properties(opencl_workers PROPERTIES LABELS "experimental;opencl" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 add_test(NAME opencl_t1_validation
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_t1_validation.py")

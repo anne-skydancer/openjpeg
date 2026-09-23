@@ -4,11 +4,11 @@ This branch starts at OpenJPEG **v2.5.4**, commit
 `6c4a29b00211eb0430fa0e5e890f1ce5c80f409f`. It implements an optional native
 OpenCL decoding backend without changing the public OpenJPEG API.
 
-**Status: experimental backend with a measured gain over one CPU thread.**
-The current RX 9070 XT corpus averages 20.124 ms per texture on the GPU versus
-27.541 ms with one CPU decoding thread. CPU decoding with two or more threads
-is still faster on this corpus. The backend remains disabled by default;
-Vulkanstorm's package and shipping decoder have not been changed.
+**Status: experimental concurrent GPU backend.** On the qualified RX 9070 XT,
+four image workers deliver about **111 textures/s**, versus **49 textures/s**
+with one GPU worker. Four CPU image workers reach about **136 textures/s** on
+the same corpus. The GPU backend remains disabled by default; Vulkanstorm's
+package and shipping decoder have not been changed.
 
 ## Decoding path
 
@@ -25,8 +25,9 @@ Coefficients and reconstructed planes remain on the GPU between these stages.
 The final planar integer samples return through the existing OpenJPEG API.
 This is not direct GPU texture upload or asynchronous viewer integration.
 
-A persistent context, in-order queue, program, kernels and device buffers are
-reused. Buffer capacity across the pool stays within the 64 MiB aggregate cap;
+One persistent context and compiled program are shared. Each GPU worker owns
+its own in-order queue, kernel objects/arguments, events and reusable buffers.
+Buffer capacity across **all workers** stays within the 64 MiB aggregate cap;
 independent high-water marks cannot accumulate beyond it. Failed jobs drain the
 queue and discard their pooled buffers before freeing host staging.
 
@@ -43,16 +44,29 @@ and dynamically sized local scratch. This removes the global flags and wavelet
 scratch buffers entirely. Kernel status and pixels are checked at the final
 readback, avoiding the previous host wait between entropy and reconstruction.
 
-The host backend is thread-safe, but admits one GPU tile job at a time; concurrent
-callers use CPU fallback. It does not yet batch images or keep multiple GPU jobs
-in flight. That requires separate job arguments/buffers and a shared total memory
-budget, rather than allowing each worker its own 64 MiB pool.
+Concurrent callers, each using its own OpenJPEG codec, lease independent GPU
+slots. The default is **four slots**, configurable from one to eight through
+`OPJ_OPENCL_WORKERS` before first initialization. This does not spawn texture
+threads inside OpenJPEG: caller workers perform parsing and feed the GPU slots.
+The synchronous public API is unchanged; multiple calls can now remain in flight.
+Cross-image fusion into one kernel dispatch remains future work.
 
 ## Build and select a device
 
 The normal build needs no OpenCL headers or link library. Explicitly enabling
 `OPJ_ENABLE_OPENCL` requires Khronos headers; it dynamically loads the installed
 ICD at runtime. On Windows the DLL is loaded from System32.
+
+On Windows DLL builds, successful opt-in initialization pins the module and
+keeps the shared OpenCL runtime for the process lifetime. The OS reclaims it at
+process exit; explicit DLL unload/reload is not a resource-reset mechanism.
+Calling the GPU driver from a DLL `atexit` handler hung during shutdown in our
+runtime test. DLL CRT teardown executes those handlers under loader-lock
+restrictions, so this path deliberately avoids driver teardown there. Static
+EXE builds retain their ordinary exit cleanup. See Microsoft's
+[DLL CRT lifecycle](https://learn.microsoft.com/en-us/cpp/build/run-time-library-behavior)
+and [DllMain restrictions](https://learn.microsoft.com/en-us/windows/win32/dlls/dllmain).
+This behavior applies only after explicitly enabling the experimental backend.
 
 The development build used Khronos OpenCL-Headers revision
 `e6060189f4ebe8b52d885c37af71b9a50c272154`, cloned into the ignored
@@ -73,6 +87,8 @@ one GPU. Two ICD versions expose gfx1201 on this machine, so the driver selector
 is material. Selection is cached on first initialization; change it in a new
 process. Unset `OPJ_OPENCL_DEVICE` for the CPU path. Set `OPJ_OPENCL_PROFILE`
 before initialization for experimental per-stage event timings.
+`OPJ_OPENCL_WORKERS` is also cached on first initialization (default 4, range
+1-8); invalid values leave decoding on the CPU.
 
 Hardware qualification uses the existing **AMD RX 9070 XT / driver 3679.0**.
 NVIDIA, Intel and Linux execution remain unverified; no additional hardware
@@ -86,13 +102,20 @@ matching component geometry/resolutions/precision/signedness, precision up to
 Reduced resolutions and reduced quality layers are supported. Component
 selection, partial-area decoding, heterogeneous components, custom transforms
 and HTJ2K use CPU decoding. Tile dimensions are limited to 4096 and combined
-per-job device buffers to **64 MiB**; host staging is additional.
+pooled device buffers across all jobs to **64 MiB**; host staging, local memory
+and driver allocations are additional.
 
-A nonblocking process-wide lock admits one GPU job. Other decoder workers use
-the CPU if it is busy. Unsupported input, unavailable/ambiguous devices,
-allocation refusal and OpenCL errors fall back to CPU. Host tile output is
-committed only after the entire GPU job and final readback succeed. This is
-not yet complete malformed-input, concurrency or device-loss qualification.
+A short admission lock protects initialization, slot leasing and the shared
+allocation budget. It is released before uploads or decoding. A condition
+variable parks eligible callers when slots or budget are busy; this contention
+does not silently turn GPU benchmarks into mixed CPU/GPU runs. Idle buffers can
+be reclaimed to admit larger jobs; active buffers are never evicted.
+
+Unsupported input, unavailable/ambiguous devices, allocation refusal and OpenCL
+errors still fall back to CPU. Host output is committed only after successful
+GPU decoding/readback. Completion and diagnostic callbacks run after returning
+the slot, allowing a callback to decode another image without self-deadlocking.
+This is not yet complete malformed-input or device-loss qualification.
 
 ## Validation
 
@@ -112,6 +135,22 @@ RelWithDebInfo CPU-only library builds without either the OpenCL selector or
 reference-capture environment-variable string. The OpenCL-enabled
 RelWithDebInfo shared DLL also builds successfully; 17 selected upstream
 self-contained CPU regression tests pass (not the full external-data suite).
+
+`test_workers.py` verifies every decoded pixel against CPU reference files with
+eight callers sharing 1/2/4/8 GPU slots. Heterogeneous small images and three
+1024-square RGB images exercise independent kernel arguments and admission
+pressure: the three large jobs cannot simultaneously fit within the budget.
+The test requires every eligible tile to run on the GPU and checks observed
+active slots and pooled byte counts. `test_reentrant.c` performs a nested decode
+from a completion callback with only one slot, checking exact output and return.
+The native six-test CTest suite passes, including the 156-case image matrix.
+
+The 32 private real cache textures also passed byte-for-byte concurrent checks
+with eight callers at all four slot counts, covering 384 GPU tile decodes.
+An additional 96 cached-texture decodes passed through the shared DLL with
+concurrent profiling enabled, followed by normal process exit. The shared DLL
+also passed the one-slot nested-callback check. No cached images or reference
+pixels are included in Git.
 
 The Tier-1 reference corpus covers all 64 combinations of
 BYPASS/RESET/TERMALL/VSC/PTERM/SEGSYM, multiple block/image sizes, two transforms,
@@ -148,7 +187,7 @@ tile decoded on the GPU. These tests do not establish complete Part 1
 conformance, independent-encoder interoperability, arbitrary truncated-payload
 handling or viewer image quality across every texture.
 
-## Performance evidence (2026-09-23)
+## Sequential performance evidence (2026-09-23, before concurrent slots)
 
 `bench_decode` is a development-only public-API benchmark. It decodes the 32
 cached textures in one process, excludes its first corpus pass from the warm
@@ -216,12 +255,58 @@ $env:OPJ_OPENCL_DRIVER = '3679'
 build/gpu/bin/RelWithDebInfo/bench_decode.exe 5 @inputs
 ```
 
-The remaining opportunities are improving entropy execution and overlapping
-independent images with CPU parsing and transfers. Cross-image batching needs
-an explicit scheduling design; adding CPU decoder threads alone does not make
-the current single-job GPU queue concurrent. Further qualification must cover
-malformed/truncated streams, contention and device failure before package/viewer
-integration. Keep the backend opt-in until workload-level results justify it.
+## Concurrent throughput (2026-09-23)
+
+`bench_workers` creates independent public-API codecs on caller threads. Its
+arguments are image-worker count, CPU threads **per image**, warm corpus rounds,
+then input files. Each round schedules every input exactly once. Worker startup,
+join, file reads, parsing, GPU work/readback and output checksumming are included.
+The first round is excluded from warm throughput. Reference file I/O is disabled
+for timing runs. The reported `warm_ms_per_image` is wall time divided by image
+count, **not individual-image latency**.
+
+The comparison below uses the same 32 cached textures, three separate processes
+per setting, five warm rounds per process (480 measured images per setting).
+Run order was reversed in the middle trial. Each decoder has one CPU thread per
+image; GPU slot count matches the image-worker count. Checksums agree across
+all modes and trials. GPU completion count equals total tile count in every run.
+
+| Concurrent image workers | CPU textures/s | GPU textures/s | GPU run range |
+| --- | ---: | ---: | ---: |
+| 1 | 36.34 | 49.11 | 47.86-49.85 |
+| 2 | 71.35 | 87.02 | 86.42-87.78 |
+| 4 | 135.93 | **110.76** | 108.16-112.40 |
+| 8 | 200.97 | 116.84 | 111.53-121.00 |
+
+Four GPU workers deliver **2.26x** the single-worker throughput. Eight add only
+about **5.5%** beyond four, so the default remains four. The 64 MiB buffer cap
+limited peak admitted jobs to five or six in the eight-worker runs; peak pooled
+capacity stayed below 66,511,000 bytes (about 63.43 MiB). Kernel/program/driver
+memory and CPU staging are not part of this buffer accounting.
+
+The GPU wins at one/two image workers in this workload, but CPU image workers
+scale better at four/eight. Concurrent GPU submission alone has not removed the
+remaining entropy-decoding/device bottleneck. These results do not establish a
+viewer FPS gain or behavior while the GPU is simultaneously rendering a busy sim.
+
+```powershell
+$inputs = Get-ChildItem build/cache-corpus/*.j2k | ForEach-Object FullName
+Remove-Item Env:OPJ_OPENCL_DEVICE -ErrorAction SilentlyContinue
+build/gpu/bin/RelWithDebInfo/bench_workers.exe 4 1 5 @inputs
+$env:OPJ_OPENCL_DEVICE = 'gfx1201'
+$env:OPJ_OPENCL_DRIVER = '3679'
+$env:OPJ_OPENCL_WORKERS = '4'
+build/gpu/bin/RelWithDebInfo/bench_workers.exe 4 1 5 @inputs
+```
+
+For exact concurrency checks, run once with `--write-reference DIRECTORY` on the
+CPU, then `--verify-reference DIRECTORY` on the GPU with the identical ordered
+input list. The directory must exist. Both options compare/write all component
+metadata and sample bytes; use neither option for throughput measurements.
+
+Remaining work includes improving entropy execution, evaluating cross-image
+batching, and qualification under rendering load, malformed/truncated input and
+device failure. Keep the backend opt-in until workload-level results justify it.
 
 ## Provenance
 
