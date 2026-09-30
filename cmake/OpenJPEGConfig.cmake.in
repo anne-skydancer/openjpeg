@@ -6,6 +6,10 @@
 # module to load OPENJPEG's settings for an external project.
 @OPENJPEG_CONFIG_INSTALL_ONLY@
 @PACKAGE_INIT@
+if(@OPJ_ENABLE_OPENCL@ OR @OPJ_ENABLE_CUDA@)
+  include(CMakeFindDependencyMacro)
+  find_dependency(Threads)
+endif()
 # The OPENJPEG version number.
 set(OPENJPEG_MAJOR_VERSION "@OPENJPEG_VERSION_MAJOR@")
 set(OPENJPEG_MINOR_VERSION "@OPENJPEG_VERSION_MINOR@")

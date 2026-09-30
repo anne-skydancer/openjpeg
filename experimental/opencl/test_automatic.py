@@ -18,6 +18,7 @@ def main():
     root=Path(tempfile.mkdtemp(prefix="run-",dir=args.out)).resolve()
     binary=args.bin.resolve()
     automatic={k:v for k,v in os.environ.items() if not k.startswith("OPJ_OPENCL_") and k!="OPJ_T1_CAPTURE_FILE"}
+    automatic["OPJ_DECODE_BACKEND"]="opencl"
     cpu=dict(automatic,OPJ_OPENCL_DEVICE="off",OPJ_OPENCL_ENCODE_DEVICE="off")
     raw=root/"source.pgm"
     raw.write_bytes(b"P5\n65 67\n255\n"+bytes((x*19+y*31)%256 for y in range(67) for x in range(65)))
