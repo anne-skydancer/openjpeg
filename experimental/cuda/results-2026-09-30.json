@@ -1,0 +1,147 @@
+{
+  "date": "2026-09-30",
+  "gpu": "NVIDIA GeForce RTX 5070 Ti",
+  "driver": "617.14",
+  "cpu": "AMD Ryzen 9 9950X3D",
+  "configuration": "RelWithDebInfo, MSVC 19.44, CUDA 12.9.86",
+  "conditions": "Viewer closed. Median of three runs, each with three warm corpus passes. One CPU decoder thread per caller. CUDA may fall back on admission pressure.",
+  "images": 32,
+  "summary": [
+    {
+      "backend": "cpu",
+      "callers": 1,
+      "median_ms_per_image": 26.027,
+      "gpu_tiles": [
+        0,
+        0,
+        0
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "opencl",
+      "callers": 1,
+      "median_ms_per_image": 11.274,
+      "gpu_tiles": [
+        128,
+        128,
+        128
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "cuda",
+      "callers": 1,
+      "median_ms_per_image": 9.718,
+      "gpu_tiles": [
+        128,
+        128,
+        128
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "cpu",
+      "callers": 4,
+      "median_ms_per_image": 7.049,
+      "gpu_tiles": [
+        0,
+        0,
+        0
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "opencl",
+      "callers": 4,
+      "median_ms_per_image": 6.957,
+      "gpu_tiles": [
+        128,
+        128,
+        128
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "cuda",
+      "callers": 4,
+      "median_ms_per_image": 5.947,
+      "gpu_tiles": [
+        100,
+        100,
+        100
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "cpu",
+      "callers": 8,
+      "median_ms_per_image": 4.765,
+      "gpu_tiles": [
+        0,
+        0,
+        0
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "opencl",
+      "callers": 8,
+      "median_ms_per_image": 6.754,
+      "gpu_tiles": [
+        128,
+        128,
+        128
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    },
+    {
+      "backend": "cuda",
+      "callers": 8,
+      "median_ms_per_image": 4.404,
+      "gpu_tiles": [
+        78,
+        76,
+        75
+      ],
+      "tiles": [
+        128,
+        128,
+        128
+      ]
+    }
+  ],
+  "corpus_sha256": "3a8f27e5d07b56fa656ec3cb3787df9160f6f476585fb130098b9ff8f262295f"
+}

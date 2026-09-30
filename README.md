@@ -86,3 +86,12 @@ API available is the one supported by OpenJPEG.
 [badge-coverity]: https://scan.coverity.com/projects/6383/badge.svg "Coverity Scan Build Status"
 [link-coverity]: https://scan.coverity.com/projects/uclouvain-openjpeg "Coverity Scan Build Status"
 [link-api-timeline]: http://www.openjpeg.org/abi-check/timeline/openjpeg "OpenJPEG API/ABI timeline"
+
+## Automatic NVIDIA CUDA decoding
+
+The fork includes CUDA decoding by default in supported 64-bit Windows/Linux
+builds and selects it automatically on compatible NVIDIA GPUs, alongside the
+existing OpenCL backend. See [build instructions, resource limits, tests and
+measured results](experimental/cuda/README.md). Build machines need a compatible CUDA toolkit; end users need only the NVIDIA
+driver. Explicitly disable CUDA with `OPJ_ENABLE_CUDA=OFF`. No nvJPEG2000
+dependency is used.

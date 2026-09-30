@@ -61,11 +61,12 @@ static void info(const char *message,void *data)
         }
     }
 #else
-    if(strstr(message,"OpenCL decoded tile")) {
+    if((strstr(message,"OpenCL decoded tile") || strstr(message,"CUDA decoded tile"))) {
         unsigned slot,active;
         unsigned long long bytes;
         ++job->gpu_tiles;
-        if(sscanf(message,"OpenCL decoded tile %*u (%*u blocks) worker %u active %u pooled %llu",&slot,&active,&bytes)==3) {
+        if(sscanf(message,"OpenCL decoded tile %*u (%*u blocks) worker %u active %u pooled %llu",&slot,&active,&bytes)==3 ||
+           sscanf(message,"CUDA decoded tile %*u (%*u blocks) worker %u active %u pooled %llu",&slot,&active,&bytes)==3) {
             if(slot<8) job->worker_mask|=1u<<slot;
             if(active>job->peak_active) job->peak_active=active;
             if(bytes>job->peak_pool_bytes) job->peak_pool_bytes=bytes;

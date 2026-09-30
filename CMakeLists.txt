@@ -299,6 +299,12 @@ if(OPJ_BUILD_OPENCL_EXPERIMENTS)
   add_subdirectory(experimental/opencl)
 endif()
 
+option(OPJ_BUILD_CUDA_EXPERIMENTS "Build development-only CUDA decode tests (not installed)." OFF)
+if(OPJ_BUILD_CUDA_EXPERIMENTS)
+  enable_testing()
+  add_subdirectory(experimental/cuda)
+endif()
+
 # install all targets referenced as OPENJPEGTargets (relocatable with CMake 3.0+)
 install(EXPORT OpenJPEGTargets DESTINATION ${OPENJPEG_INSTALL_PACKAGE_DIR})
 include(CMakePackageConfigHelpers)

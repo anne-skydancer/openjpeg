@@ -40,6 +40,9 @@
  */
 
 #include "opj_includes.h"
+#ifdef OPJ_HAVE_ACCEL_DECODE
+#include "accel_decode.h"
+#endif
 #ifdef OPJ_HAVE_OPENCL
 #include "opencl_backend.h"
 #endif
@@ -1735,8 +1738,8 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
     /* FIXME _ProfStop(PGROUP_T2); */
 
     /*------------------TIER1-----------------*/
-#ifdef OPJ_HAVE_OPENCL
-    if (opj_opencl_decode_tile(p_tcd, p_manager)) {
+#ifdef OPJ_HAVE_ACCEL_DECODE
+    if (opj_accel_decode_tile(p_tcd, p_manager)) {
         return OPJ_TRUE;
     }
 #endif

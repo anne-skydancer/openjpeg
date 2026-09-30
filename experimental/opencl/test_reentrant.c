@@ -34,13 +34,13 @@ static opj_image_t *decode(const char *path,opj_msg_callback callback,void *data
 static void nested_info(const char *message,void *data)
 {
     test_state *state=(test_state*)data;
-    if(strstr(message,"OpenCL decoded tile")) ++state->nested_gpu;
+    if((strstr(message,"OpenCL decoded tile") || strstr(message,"CUDA decoded tile"))) ++state->nested_gpu;
 }
 
 static void outer_info(const char *message,void *data)
 {
     test_state *state=(test_state*)data;
-    if(!state->entered && strstr(message,"OpenCL decoded tile")) {
+    if(!state->entered && (strstr(message,"OpenCL decoded tile") || strstr(message,"CUDA decoded tile"))) {
         state->entered=1;
         state->nested=decode(state->path,nested_info,state);
     }

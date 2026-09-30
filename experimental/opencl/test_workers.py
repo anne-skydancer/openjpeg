@@ -12,7 +12,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--device", required=True)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--backend", choices=("opencl","cuda"), default="opencl")
     parser.add_argument("--driver", default="")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -23,6 +24,7 @@ def main():
     cpu = os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE", "OPJ_OPENCL_DRIVER", "OPJ_OPENCL_WORKERS", "OPJ_OPENCL_PROFILE", "OPJ_T1_CAPTURE_FILE"):
         cpu.pop(key, None)
+    cpu["OPJ_DECODE_BACKEND"]="cpu"
     cpu["OPJ_OPENCL_DEVICE"]="off"
     cpu["OPJ_OPENCL_ENCODE_DEVICE"]="off"
     sources = []
@@ -46,19 +48,26 @@ def main():
                                    callers, 1, 2, *sources], env))
     expected = run("--write-reference", cpu, 4)
     gpu_single = dict(cpu, OPJ_OPENCL_DEVICE=args.device, OPJ_OPENCL_DRIVER=args.driver,
-                      OPJ_OPENCL_WORKERS="1")
+                      OPJ_OPENCL_WORKERS="1", OPJ_DECODE_BACKEND=args.backend, OPJ_CUDA_WORKERS="1")
     execute([binary / ("test_opencl_reentrant"+SUFFIX), sources[3]], gpu_single)
     for slots in (1,2,4,8):
         gpu = dict(cpu, OPJ_OPENCL_DEVICE=args.device, OPJ_OPENCL_DRIVER=args.driver,
-                   OPJ_OPENCL_WORKERS=str(slots))
+                   OPJ_OPENCL_WORKERS=str(slots), OPJ_DECODE_BACKEND=args.backend, OPJ_CUDA_WORKERS=str(slots))
         actual = run("--verify-reference", gpu, 8)
         assert actual["checksums"] == expected["checksums"], actual
-        assert actual["gpu_tiles"] == actual["tiles"] == 3*len(sources), actual
+        assert actual["tiles"] == 3*len(sources), actual
+        if args.backend=="cuda":
+            # Nonblocking CUDA admission deliberately falls back under pressure.
+            assert 0 < actual["gpu_tiles"] <= actual["tiles"], actual
+            assert 0 < actual["peak_pool_bytes"] <= 64*1024*1024, actual
+            assert 1 <= actual["peak_active"] <= slots, actual
+            continue
+        assert actual["gpu_tiles"] == actual["tiles"], actual
         assert 0 < actual["peak_pool_bytes"] <= 64*1024*1024, actual
         assert 1 <= actual["peak_active"] <= slots, actual
         if slots>1:
             assert actual["peak_active"]>1, actual
-    print("PASS: exact concurrent pixels at 1/2/4/8 slots; all jobs on GPU; pool <=64 MiB")
+    print("PASS: exact concurrent pixels and recursive callbacks at 1/2/4/8 slots:", args.backend)
 
 
 if __name__ == "__main__":

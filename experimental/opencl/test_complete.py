@@ -34,7 +34,7 @@ def compare(source, binary, directory, gpu_env, cpu_env, discard=0, layer=0):
         outputs.append({p.name: p.read_bytes() for p in target.glob("*.pgx")})
     (directory / "decode.log").write_text("\n".join(logs))
     if (not logs[0].count("Header of tile ") or
-            logs[1].count("OpenCL decoded tile") != logs[0].count("Header of tile ")):
+            logs[1].count("CUDA decoded tile" if gpu_env.get("OPJ_DECODE_BACKEND") == "cuda" else "OpenCL decoded tile") != logs[0].count("Header of tile ")):
         raise AssertionError(f"GPU backend did not run: {source}\n{logs[1]}")
     if not outputs[0] or outputs[0] != outputs[1]:
         mismatches = []
@@ -51,7 +51,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--device", required=True)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--backend", choices=("opencl", "cuda"), default="opencl")
     parser.add_argument("--driver", default="")
     parser.add_argument("--cache-corpus", type=Path)
     args = parser.parse_args()
@@ -62,9 +63,11 @@ def main():
     cpu_env = os.environ.copy()
     for key in ("OPJ_OPENCL_DEVICE", "OPJ_OPENCL_DRIVER", "OPJ_T1_CAPTURE_FILE"):
         cpu_env.pop(key, None)
+    cpu_env["OPJ_DECODE_BACKEND"]="cpu"
     cpu_env["OPJ_OPENCL_DEVICE"]="off"
     cpu_env["OPJ_OPENCL_ENCODE_DEVICE"]="off"
-    gpu_env = dict(cpu_env, OPJ_OPENCL_DEVICE=args.device, OPJ_OPENCL_DRIVER=args.driver)
+    gpu_env = dict(cpu_env, OPJ_OPENCL_DEVICE=args.device, OPJ_OPENCL_DRIVER=args.driver,
+                   OPJ_DECODE_BACKEND=args.backend, OPJ_CUDA_DEVICE="auto")
     rng = random.Random(97053)
     count = components = 0
     started = time.perf_counter()

@@ -1,0 +1,28 @@
+if(NOT OPJ_ENABLE_CUDA OR NOT BUILD_CODEC)
+  message(FATAL_ERROR "CUDA tests require OPJ_ENABLE_CUDA and BUILD_CODEC")
+endif()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_package(Threads REQUIRED)
+foreach(tool bench_decode bench_workers test_opencl_reentrant)
+  if(NOT TARGET ${tool})
+    set(source ${tool})
+    if(tool STREQUAL "test_opencl_reentrant")
+      set(source test_reentrant)
+    endif()
+    add_executable(${tool} "../opencl/${source}.c")
+    target_include_directories(${tool} PRIVATE "${OPENJPEG_SOURCE_DIR}/src/lib/openjp2" "${OPENJPEG_BINARY_DIR}/src/lib/openjp2")
+    target_link_libraries(${tool} openjp2 Threads::Threads)
+  endif()
+endforeach()
+foreach(test complete workers)
+  add_test(NAME cuda_${test} COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../opencl/test_${test}.py"
+    --backend cuda --bin "$<TARGET_FILE_DIR:opj_decompress>" --out "${CMAKE_CURRENT_BINARY_DIR}/${test}")
+  set_tests_properties(cuda_${test} PROPERTIES LABELS "experimental;cuda" TIMEOUT 240 RUN_SERIAL TRUE)
+endforeach()
+add_test(NAME cuda_policy COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_policy.py"
+  --bin "$<TARGET_FILE_DIR:opj_decompress>" --out "${CMAKE_CURRENT_BINARY_DIR}/policy")
+set_tests_properties(cuda_policy PROPERTIES LABELS "experimental;cuda" TIMEOUT 180 RUN_SERIAL TRUE)
+
+add_test(NAME cuda_partial COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_partial.py"
+  --bin "$<TARGET_FILE_DIR:opj_decompress>" --out "${CMAKE_CURRENT_BINARY_DIR}/partial")
+set_tests_properties(cuda_partial PROPERTIES LABELS "experimental;cuda" TIMEOUT 120 RUN_SERIAL TRUE)

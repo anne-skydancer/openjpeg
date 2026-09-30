@@ -13,7 +13,7 @@ static double now_ms(void) { LARGE_INTEGER t,f; QueryPerformanceCounter(&t); Que
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000.0+t.tv_nsec/1000000.0; }
 #endif
 static unsigned gpu_tiles;
-static void info(const char *message,void *data) { (void)data; if(strstr(message,"OpenCL decoded tile")) ++gpu_tiles; if(strstr(message,"OpenCL timings:")) fputs(message,stderr); }
+static void info(const char *message,void *data) { (void)data; if((strstr(message,"OpenCL decoded tile") || strstr(message,"CUDA decoded tile"))) ++gpu_tiles; if(strstr(message,"OpenCL timings:") || strstr(message,"CUDA timings:")) fputs(message,stderr); }
 static void error(const char *message,void *data) { (void)data; fputs(message,stderr); }
 
 int main(int argc,char **argv)
