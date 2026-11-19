@@ -2,9 +2,14 @@
 /*
  * Non-regression tests for decoding cut codestreams in non-strict mode and for
  * the decoder's resource limits (opj_decoder_set_limits). Self-contained: every
- * codestream is encoded or written in memory.
+ * codestream is encoded or written in memory, except for ppt_layers, which reads
+ * a stream of the conformance data.
  *
- * usage: test_partial_decode_limits [test]   (no test: all of them)
+ * usage: test_partial_decode_limits [test]   (no test: all of them but ppt_layers)
+ *        test_partial_decode_limits ppt_layers <p1_02.j2k>
+ *   ppt_layers  every cut at a layer boundary of the conformance stream p1_02.j2k
+ *               (packet headers in PPT) decodes as the whole file limited to
+ *               those layers
  *   setfactor   a reduce factor set after the header is checked before it is
  *               applied (upstream issue #1631)
  *   limits_api  the contract of opj_decoder_limits_init and opj_decoder_set_limits
@@ -885,6 +890,57 @@ static void test_cuts(void)
     }
 }
 
+/* ISO/IEC 15444-4 p1_02.j2k (conformance data): one tile, LRCP, 19 layers, packet
+ * headers in PPT markers, so the tile data carries the packet bodies only. A cut
+ * where layer k's data ends must decode exactly as the whole file limited to k
+ * layers (cp_layer), at reduce 0 and 2: the packed headers that follow the cut are
+ * read in step, and a code-block that lost passes gets no more. The offsets are
+ * where each layer's packet data ends in that file (layer 19 has none). */
+static void test_ppt_layers(const char *path)
+{
+    static const size_t ends[19] = {
+        6096, 6524, 7144, 9671, 9695, 12818, 12980, 16240, 16483, 19511, 21315, 23184,
+        43497, 54849, 90586, 122332, 209066, 263088, 263088
+    };
+    static const unsigned reduces[2] = { 0, 2 };
+    buffer_t in;
+    FILE *f = fopen(path, "rb");
+    long n;
+    unsigned k, r;
+
+    memset(&in, 0, sizeof(in));
+    if (!f) {
+        fprintf(stderr, "cannot read %s\n", path);
+        exit(2);
+    }
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf_reserve(&in, (size_t)n);
+    in.size = fread(in.data, 1, (size_t)n, f);
+    fclose(f);
+    CHECK(in.size == 263090, "ppt_layers: %s is not the expected p1_02.j2k", path);
+    if (in.size != 263090) {
+        free(in.data);
+        return;
+    }
+    for (r = 0; r < 2; ++r) {
+        for (k = 1; k <= 19; ++k) {
+            int cut_stage, layer_stage;
+            opj_image_t *cut = decode(&in, ends[k - 1], reduces[r], 0, 0, NULL,
+                                      OPJ_CODEC_J2K, &cut_stage);
+            opj_image_t *layers = decode(&in, in.size, reduces[r], k, 0, NULL,
+                                         OPJ_CODEC_J2K, &layer_stage);
+            CHECK(cut_stage == 2 && layer_stage == 2 && same_image(cut, layers),
+                  "ppt_layers reduce %u: the cut at the end of layer %u does not decode "
+                  "as the first %u layers", reduces[r], k, k);
+            opj_image_destroy(cut);
+            opj_image_destroy(layers);
+        }
+    }
+    free(in.data);
+}
+
 int main(int argc, char **argv)
 {
     static const struct {
@@ -901,6 +957,10 @@ int main(int argc, char **argv)
     size_t i;
     int ran = 0;
 
+    if (argc >= 3 && !strcmp(argv[1], "ppt_layers")) {
+        test_ppt_layers(argv[2]);
+        ++ran;
+    }
     for (i = 0; i < sizeof(tests) / sizeof(tests[0]); ++i) {
         if (argc < 2 || !strcmp(argv[1], tests[i].name)) {
             tests[i].run();
