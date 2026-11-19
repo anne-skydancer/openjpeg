@@ -82,11 +82,12 @@ if(NOT WIN32 AND CMAKE_COMPILER_IS_GNUCC AND CMAKE_C_COMPILER MATCHES ".*mingw32
 endif()
 
 # Build the library
-set(OPJ_OPENCL_DEFAULT OFF)
-if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(OPJ_OPENCL_DEFAULT ON)
-endif()
-option(OPJ_ENABLE_OPENCL "Enable automatic OpenCL acceleration with CPU fallback" ${OPJ_OPENCL_DEFAULT})
+# The GPU backends are off unless asked for: the CUDA one needs the CUDA toolkit
+# at configure time, so a default build failed on every machine without it
+# (the project's own CI included), and the Vulkanstorm packages build without
+# both (OPJ_ENABLE_OPENCL=OFF, OPJ_ENABLE_CUDA=OFF) since GPU decoding was
+# dropped on 2026-10-02.
+option(OPJ_ENABLE_OPENCL "Enable automatic OpenCL acceleration with CPU fallback" OFF)
 if(OPJ_ENABLE_OPENCL)
   install(FILES "${OPENJPEG_SOURCE_DIR}/thirdparty/opencl/LICENSE"
     DESTINATION "${CMAKE_INSTALL_DOCDIR}" RENAME OpenCL-Headers-LICENSE)
@@ -107,18 +108,9 @@ if(OPJ_ENABLE_OPENCL)
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/opencl_kernels.h" "${cl_bundle}")
   list(APPEND OPENJPEG_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/opencl_backend.c")
 endif()
-# Include CUDA in ordinary 64-bit Windows/Linux binaries regardless of the
-# build machine's GPU. Runtime driver/device checks select CUDA or fall back.
-# Cross builds and unsupported host targets can enable it explicitly with an
-# appropriate CUDA kernel toolchain.
-set(OPJ_CUDA_DEFAULT OFF)
-if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_CROSSCOMPILING)
-  if((WIN32 AND MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$") OR
-     (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64)$"))
-    set(OPJ_CUDA_DEFAULT ON)
-  endif()
-endif()
-option(OPJ_ENABLE_CUDA "Build automatic NVIDIA CUDA decoding with CPU fallback" ${OPJ_CUDA_DEFAULT})
+# When enabled, CUDA is included in 64-bit Windows/Linux binaries regardless of
+# the build machine's GPU; runtime driver/device checks select CUDA or fall back.
+option(OPJ_ENABLE_CUDA "Build automatic NVIDIA CUDA decoding with CPU fallback" OFF)
 if(OPJ_ENABLE_CUDA OR OPJ_ENABLE_OPENCL)
   list(APPEND OPENJPEG_SRCS accel_decode.c accel_budget.c)
 endif()
