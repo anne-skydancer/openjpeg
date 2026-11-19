@@ -29,6 +29,8 @@
  *               UndefinedBehaviorSanitizer it catches the windowed inverse DWT
  *               reading samples it never loaded (ISO p0_12.j2k, 3 x 5, 4
  *               resolutions: signed overflow at dwt.c in the lifting step)
+   encode_termall16 TERMALL encodes of 9 to 16 bit samples stay inside their code-block buffers
+               (run under AddressSanitizer) and decode to their samples
  */
 
 #include <math.h>
@@ -1087,6 +1089,195 @@ static void test_decode_area_iso(const char *path)
     free(in.data);
 }
 
+/* ------------------------------------------------------------ encoder fixes */
+
+static unsigned g_seed = 12345;
+static unsigned lcg(void)
+{
+    g_seed = g_seed * 1664525u + 1013904223u;
+    return g_seed >> 8;
+}
+
+typedef struct {
+    int w, h, comps, prec, sgnd;
+    int kind;     /* 0 noise over the whole range, 1 3 x 3 blocks of the two extremes, 2 a ramp, 3 sparse extremes */
+    int numres, mode, cbw, cbh, layers, mct, eph;
+    const char *guard; /* "GUARD_BITS=n" or NULL */
+} enc_case_t;
+
+/* Encodes without loss. Returns 1 and the stream in out, or 0 when the encoder refuses the
+ * image; ref receives the samples the stream must decode to. */
+static int enc_case(const enc_case_t *k, buffer_t *out, opj_image_t **ref)
+{
+    opj_cparameters_t p;
+    opj_image_cmptparm_t cp[4];
+    opj_image_t *img;
+    opj_codec_t *c;
+    opj_stream_t *s;
+    int i, x, y, ok;
+    const int lo = k->sgnd ? -(1 << (k->prec - 1)) : 0;
+    const int hi = k->sgnd ? (1 << (k->prec - 1)) - 1 : (1 << k->prec) - 1;
+
+    memset(out, 0, sizeof(*out));
+    memset(cp, 0, sizeof(cp));
+    for (i = 0; i < k->comps; ++i) {
+        cp[i].dx = cp[i].dy = 1;
+        cp[i].w = (OPJ_UINT32)k->w;
+        cp[i].h = (OPJ_UINT32)k->h;
+        cp[i].prec = (OPJ_UINT32)k->prec;
+        cp[i].sgnd = (OPJ_UINT32)k->sgnd;
+    }
+    img = opj_image_create((OPJ_UINT32)k->comps, cp,
+                           k->comps >= 3 ? OPJ_CLRSPC_SRGB : OPJ_CLRSPC_GRAY);
+    *ref = opj_image_create((OPJ_UINT32)k->comps, cp,
+                            k->comps >= 3 ? OPJ_CLRSPC_SRGB : OPJ_CLRSPC_GRAY);
+    img->x0 = img->y0 = 0;
+    img->x1 = (OPJ_UINT32)k->w;
+    img->y1 = (OPJ_UINT32)k->h;
+    for (i = 0; i < k->comps; ++i) {
+        for (y = 0; y < k->h; ++y) {
+            for (x = 0; x < k->w; ++x) {
+                const int v = k->kind == 0 ? lo + (int)(lcg() % ((unsigned)(hi - lo) + 1u)) :
+                              k->kind == 2 ? lo + (int)(((double)(hi - lo)) *
+                                      (x + 2 * y + 3 * i + (int)(lcg() & 3)) / (k->w + 2 * k->h + 8)) :
+                              k->kind == 3 ? ((lcg() % 29) == 0 ? hi : lo + (hi - lo) / 2) :
+                              (((x / 3 + y / 3 + i) & 1) ? hi : lo);
+                img->comps[i].data[y * k->w + x] = v;
+                (*ref)->comps[i].data[y * k->w + x] = v;
+            }
+        }
+    }
+
+    opj_set_default_encoder_parameters(&p);
+    p.cp_disto_alloc = 1;
+    p.tcp_numlayers = k->layers;
+    for (i = 0; i < k->layers; ++i) {
+        p.tcp_rates[i] = 1.0f + 0.25f * (float)(k->layers - 1 - i);
+    }
+    p.tcp_rates[k->layers - 1] = 0.0f;
+    p.numresolution = k->numres;
+    p.cblockw_init = k->cbw;
+    p.cblockh_init = k->cbh;
+    p.irreversible = 0;
+    p.mode = k->mode;
+    p.tcp_mct = k->mct;
+    if (k->eph) {
+        p.csty |= 4;
+    }
+
+    c = opj_create_compress(OPJ_CODEC_J2K);
+    opj_set_info_handler(c, quiet, NULL);
+    opj_set_warning_handler(c, quiet, NULL);
+    opj_set_error_handler(c, quiet, NULL);
+    s = mem_stream(out, OPJ_FALSE);
+    ok = opj_setup_encoder(c, &p, img);
+    if (ok && k->guard) {
+        const char *opts[2];
+        opts[0] = k->guard;
+        opts[1] = NULL;
+        ok = opj_encoder_set_extra_options(c, opts);
+    }
+    ok = ok && opj_start_compress(c, img, s) && opj_encode(c, s) && opj_end_compress(c, s);
+    opj_stream_destroy(s);
+    opj_destroy_codec(c);
+    opj_image_destroy(img);
+    if (!ok) {
+        free(out->data);
+        memset(out, 0, sizeof(*out));
+    }
+    return ok;
+}
+
+/* 1 when the stream decodes to the samples of ref */
+static int same_as(const buffer_t *enc, const opj_image_t *ref)
+{
+    int stage, same = 1;
+    opj_image_t *dec = decode(enc, enc->size, 0, 0, 1, NULL, OPJ_CODEC_J2K, &stage);
+    OPJ_UINT32 i;
+    size_t k;
+
+    if (!dec || dec->numcomps != ref->numcomps) {
+        opj_image_destroy(dec);
+        return 0;
+    }
+    for (i = 0; i < ref->numcomps && same; ++i) {
+        const size_t n = (size_t)ref->comps[i].w * ref->comps[i].h;
+        for (k = 0; k < n; ++k) {
+            if (dec->comps[i].data[k] != ref->comps[i].data[k]) {
+                same = 0;
+                break;
+            }
+        }
+    }
+    opj_image_destroy(dec);
+    return same;
+}
+
+/* Fork audit S5 / neo-j2k OD-4: with TERMALL every pass is terminated and the MQ flush of a
+ * pass wrote up to three bytes past the code-block buffer, whose margin was measured on 8 bit
+ * samples (a one byte heap overflow with 16 bit samples; AddressSanitizer reports it). The
+ * encodes below are the case that found it (28 x 2, three 16 bit signed components, 4 x 32
+ * code-blocks, RESET and TERMALL, four layers, EPH) and its neighbours; every one that is
+ * encoded must decode to its samples. */
+static void test_encode_termall16(void)
+{
+    int i, encoded = 0;
+
+    g_seed = 7;
+    for (i = 0; i < 120; ++i) {
+        enc_case_t k;
+        buffer_t out;
+        opj_image_t *ref;
+
+        memset(&k, 0, sizeof(k));
+        if (i >= 70) {
+            /* a code-block of one sample (an edge block of the image) with the 16 bit extreme
+             * the most passes: 58 terminated passes of about two bytes, the 78 bytes of the
+             * buffer hold 38 */
+            k.w = 1 + (i - 70) % 3;
+            k.h = 1;
+            k.comps = 1;
+            k.prec = 16;
+            k.sgnd = (i - 70) / 3 & 1;
+            k.kind = 1;
+            k.numres = 1;
+            k.mode = 4 | ((i & 1) ? 1 : 0);
+            k.cbw = k.cbh = 4;
+            k.layers = 1;
+            k.guard = "GUARD_BITS=5";
+            if (enc_case(&k, &out, &ref)) {
+                ++encoded;
+                CHECK(same_as(&out, ref), "case %d: the stream does not decode to the samples", i);
+                free(out.data);
+            }
+            opj_image_destroy(ref);
+            continue;
+        }
+        k.w = i < 35 ? 28 : 1 + (int)(lcg() % 40);
+        k.h = i < 35 ? 2 : 1 + (int)(lcg() % 40);
+        k.comps = 3;
+        k.prec = i < 35 ? 16 : 9 + (int)(lcg() % 8);
+        k.sgnd = i & 1;
+        k.kind = i % 4;
+        k.numres = 1 + (int)(lcg() % 2);
+        k.mode = 1 | 4 | (i % 3 == 0 ? 32 : 0) | (i % 5 == 0 ? 8 : 0);
+        k.cbw = 4;
+        k.cbh = i < 35 ? 32 : 4 << (int)(lcg() % 4);
+        k.layers = 1 + (int)(lcg() % 2);
+        k.mct = 0;
+        k.eph = 1;
+        k.guard = "GUARD_BITS=5"; /* the guard bits are not what this test is about */
+        if (enc_case(&k, &out, &ref)) {
+            ++encoded;
+            CHECK(same_as(&out, ref), "case %d (%dx%d, %d bit): the stream does not decode to the samples",
+                  i, k.w, k.h, k.prec);
+            free(out.data);
+        }
+        opj_image_destroy(ref);
+    }
+    CHECK(encoded >= 40, "only %d of 120 TERMALL encodes of 9 to 16 bit samples succeeded", encoded);
+}
+
 int main(int argc, char **argv)
 {
     static const struct {
@@ -1100,6 +1291,7 @@ int main(int argc, char **argv)
         { "packed", test_packed },
         { "cuts", test_cuts },
         { "decode_area", test_decode_area },
+        { "encode_termall16", test_encode_termall16 },
     };
     size_t i;
     int ran = 0;

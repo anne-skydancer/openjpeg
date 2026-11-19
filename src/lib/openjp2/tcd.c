@@ -1688,6 +1688,11 @@ static OPJ_BOOL opj_tcd_code_block_enc_allocate(opj_tcd_cblk_enc_t *
     return OPJ_TRUE;
 }
 
+/* Bytes the flushes of the terminated passes of a code-block can write past the data of the
+   passes: three bytes for each of its at most 3 * numbps - 2 passes, a band holding at most
+   31 - T1_NMSEDEC_FRACBITS bit planes of the 32 bit samples */
+#define OPJ_ENC_TERM_MARGIN (3U * (3U * (31U - T1_NMSEDEC_FRACBITS) - 2U))
+
 /**
  * Allocates data memory for an encoding code block.
  */
@@ -1704,10 +1709,16 @@ static OPJ_BOOL opj_tcd_code_block_enc_allocate_data(opj_tcd_cblk_enc_t *
     /* and +33 for https://github.com/uclouvain/openjpeg/issues/1283 (-M 4) */
     /* and +63 for https://github.com/uclouvain/openjpeg/issues/1283 (-M 4 -IMF 2K) */
     /* and +74 for https://github.com/uclouvain/openjpeg/issues/1283 (-M 4 -n 8 -s 7,7 -I) */
+    /* and OPJ_ENC_TERM_MARGIN for the passes a code-block terminates (TERMALL, */
+    /* BYPASS, ...): each flush of the MQ coder writes up to three bytes past the */
+    /* data of its pass, and a 16 bit sample has up to 58 passes (the 74 bytes */
+    /* were measured on 8 bit samples, which have at most 34): an overflow of */
+    /* one byte of the heap block with 16 bit samples and TERMALL. */
     /* TODO: is there a theoretical upper-bound for the compressed code */
     /* block size ? */
-    l_data_size = 74 + (OPJ_UINT32)((p_code_block->x1 - p_code_block->x0) *
-                                    (p_code_block->y1 - p_code_block->y0) * (OPJ_INT32)sizeof(OPJ_UINT32));
+    l_data_size = 74 + OPJ_ENC_TERM_MARGIN +
+                  (OPJ_UINT32)((p_code_block->x1 - p_code_block->x0) *
+                               (p_code_block->y1 - p_code_block->y0) * (OPJ_INT32)sizeof(OPJ_UINT32));
 
     if (l_data_size > p_code_block->data_size) {
         if (p_code_block->data) {

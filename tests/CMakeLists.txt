@@ -94,7 +94,7 @@ add_test(NAME rta_interleaved_tile_parts COMMAND test_tile_part_interleaved)
 # limits (self-contained but for tpdl_ppt_layers).
 add_executable(test_partial_decode_limits test_partial_decode_limits.c)
 target_link_libraries(test_partial_decode_limits ${OPENJPEG_LIBRARY_NAME})
-foreach(tpdl_test setfactor limits_api limits psot0 packed cuts decode_area)
+foreach(tpdl_test setfactor limits_api limits psot0 packed cuts decode_area encode_termall16)
   add_test(NAME tpdl_${tpdl_test} COMMAND test_partial_decode_limits ${tpdl_test})
 endforeach()
 # With the test data: the conformance stream whose packet headers are in PPT
