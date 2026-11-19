@@ -439,6 +439,11 @@ opj_decompress -i @INPUT_CONF_PATH@/p1_06.j2k -o @TEMP_PATH@/p1_06_10_2.j2k.png 
 
 opj_decompress -i @INPUT_CONF_PATH@/p1_06.j2k -o @TEMP_PATH@/p1_06_11.j2k.png -r 4
 
+# 9/7 tiles that vanish at the decoded resolution: the whole image decodes
+opj_decompress -i @INPUT_CONF_PATH@/p1_06.j2k -o @TEMP_PATH@/p1_06_12.j2k.pgx -r 2
+opj_decompress -i @INPUT_CONF_PATH@/p1_06.j2k -o @TEMP_PATH@/p1_06_13.j2k.pgx -r 3
+opj_decompress -i @INPUT_CONF_PATH@/p1_05.j2k -o @TEMP_PATH@/p1_05_10.j2k.pgx -r 5
+
 # prec=4; nb_c=3 ; signd=yes
 opj_decompress -i @INPUT_CONF_PATH@/p0_04.j2k -o @TEMP_PATH@/p0_04.j2k.png -d 0,0,256,256
 opj_decompress -i @INPUT_CONF_PATH@/p0_04.j2k -o @TEMP_PATH@/p0_04_1.j2k.png -d 128,0,256,128
