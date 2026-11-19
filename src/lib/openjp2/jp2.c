@@ -1892,6 +1892,12 @@ void opj_jp2_decoder_set_strict_mode(opj_jp2_t *jp2, OPJ_BOOL strict)
     opj_j2k_decoder_set_strict_mode(jp2->j2k, strict);
 }
 
+void opj_jp2_decoder_set_limits(opj_jp2_t *jp2,
+                                const opj_decoder_limits_t *p_limits)
+{
+    opj_j2k_decoder_set_limits(jp2->j2k, p_limits);
+}
+
 OPJ_BOOL opj_jp2_set_threads(opj_jp2_t *jp2, OPJ_UINT32 num_threads)
 {
     return opj_j2k_set_threads(jp2->j2k, num_threads);

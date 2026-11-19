@@ -173,11 +173,26 @@ static OPJ_BOOL opj_j2k_update_rates(opj_j2k_t *p_j2k,
                                      opj_event_mgr_t * p_manager);
 
 /**
- * Copies the decoding tile parameters onto all the tile parameters.
- * Creates also the tile decoder.
+ * Prepares the tile parameters of every tile to receive a copy of the decoding
+ * tile parameters (made by opj_j2k_init_tile_parameters when the tile appears in
+ * the codestream). Creates also the tile decoder.
  */
 static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
         opj_stream_private_t *p_stream,
+        opj_event_mgr_t * p_manager);
+
+/**
+ * Copies the decoding tile parameters (the main header's) onto the parameters of
+ * one tile, the first time that tile appears in the codestream.
+ *
+ * @param       p_j2k           the jpeg2000 codec.
+ * @param       p_tile_no       the tile.
+ * @param       p_manager       the user event manager.
+ *
+ * @return      OPJ_FALSE if there is not enough memory.
+ */
+static OPJ_BOOL opj_j2k_init_tile_parameters(opj_j2k_t * p_j2k,
+        OPJ_UINT32 p_tile_no,
         opj_event_mgr_t * p_manager);
 
 /**
@@ -2087,7 +2102,7 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
     opj_image_t *l_image = 00;
     opj_cp_t *l_cp = 00;
     opj_image_comp_t * l_img_comp = 00;
-    opj_tcp_t * l_current_tile_param = 00;
+    const opj_decoder_limits_t * l_limits = 00;
 
     /* preconditions */
     assert(p_j2k != 00);
@@ -2096,6 +2111,7 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
 
     l_image = p_j2k->m_private_image;
     l_cp = &(p_j2k->m_cp);
+    l_limits = &(l_cp->m_specific_param.m_dec.m_limits);
 
     /* minimum size == 39 - 3 (= minimum component parameter) */
     if (p_header_size < 36) {
@@ -2150,6 +2166,14 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
         opj_event_msg(p_manager, EVT_ERROR,
                       "Error with SIZ marker: number of component is not compatible with the remaining number of parameters ( %d vs %d)\n",
                       l_image->numcomps, l_nb_comp);
+        return OPJ_FALSE;
+    }
+
+    if (l_limits->max_components != 0U &&
+            l_image->numcomps > l_limits->max_components) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Error with SIZ marker: %u components exceed the decoder's limit of %u\n",
+                      l_image->numcomps, l_limits->max_components);
         return OPJ_FALSE;
     }
 
@@ -2345,6 +2369,24 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
     }
     l_nb_tiles = l_cp->tw * l_cp->th;
 
+    if (l_limits->max_tiles != 0U && l_nb_tiles > l_limits->max_tiles) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Error with SIZ marker: %u tiles exceed the decoder's limit of %u\n",
+                      l_nb_tiles, l_limits->max_tiles);
+        return OPJ_FALSE;
+    }
+    /* What the header makes the decoder allocate per tile: the tile coding
+     * parameters and the tile's codestream index entry. The rest of a tile's
+     * parameters is allocated only for tiles that appear in the codestream. */
+    if (l_limits->max_memory != 0U &&
+            (OPJ_UINT64)l_nb_tiles * (sizeof(opj_tcp_t) + sizeof(opj_tile_index_t)) >
+            l_limits->max_memory) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Error with SIZ marker: the parameters of %u tiles exceed the decoder's memory limit\n",
+                      l_nb_tiles);
+        return OPJ_FALSE;
+    }
+
     /* Define the tiles which will be decoded */
     if (p_j2k->m_specific_param.m_decoder.m_discard_tiles) {
         p_j2k->m_specific_param.m_decoder.m_start_tile_x =
@@ -2471,18 +2513,8 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
         }
     }
 
-    l_current_tile_param = l_cp->tcps;
-    for (i = 0; i < l_nb_tiles; ++i) {
-        l_current_tile_param->tccps = (opj_tccp_t*) opj_calloc(l_image->numcomps,
-                                      sizeof(opj_tccp_t));
-        if (l_current_tile_param->tccps == 00) {
-            opj_event_msg(p_manager, EVT_ERROR,
-                          "Not enough memory to take in charge SIZ marker\n");
-            return OPJ_FALSE;
-        }
-
-        ++l_current_tile_param;
-    }
+    /* The tile-component parameters of a tile are allocated when the tile
+     * appears in the codestream (opj_j2k_init_tile_parameters) */
 
     /*Allocate and initialize some elements of codestrem index*/
     if (!opj_j2k_allocate_tile_element_cstr_index(p_j2k)) {
@@ -4474,6 +4506,12 @@ static OPJ_BOOL opj_j2k_read_sot(opj_j2k_t *p_j2k,
     if (p_j2k->m_current_tile_number >= l_cp->tw * l_cp->th) {
         opj_event_msg(p_manager, EVT_ERROR, "Invalid tile number %d\n",
                       p_j2k->m_current_tile_number);
+        return OPJ_FALSE;
+    }
+
+    /* The tile appears in the codestream: give it its parameters */
+    if (!opj_j2k_init_tile_parameters(p_j2k, p_j2k->m_current_tile_number,
+                                      p_manager)) {
         return OPJ_FALSE;
     }
 
@@ -6771,6 +6809,14 @@ void opj_j2k_decoder_set_strict_mode(opj_j2k_t *j2k, OPJ_BOOL strict)
         if (strict) {
             j2k->m_specific_param.m_decoder.m_nb_tile_parts_correction_checked = 1;
         }
+    }
+}
+
+void opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
+                                const opj_decoder_limits_t *p_limits)
+{
+    if (j2k && p_limits) {
+        j2k->m_cp.m_specific_param.m_dec.m_limits = *p_limits;
     }
 }
 
@@ -9191,24 +9237,15 @@ static OPJ_BOOL opj_j2k_exec(opj_j2k_t * p_j2k,
     return l_result;
 }
 
-/* FIXME DOC*/
 static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
         opj_stream_private_t *p_stream,
         opj_event_mgr_t * p_manager
                                                        )
 {
     opj_tcp_t * l_tcp = 00;
-    opj_tcp_t * l_default_tcp = 00;
     OPJ_UINT32 l_nb_tiles;
-    OPJ_UINT32 i, j;
-    opj_tccp_t *l_current_tccp = 00;
-    OPJ_UINT32 l_tccp_size;
-    OPJ_UINT32 l_mct_size;
+    OPJ_UINT32 i;
     opj_image_t * l_image;
-    OPJ_UINT32 l_mcc_records_size, l_mct_records_size;
-    opj_mct_data_t * l_src_mct_rec, *l_dest_mct_rec;
-    opj_simple_mcc_decorrelation_data_t * l_src_mcc_rec, *l_dest_mcc_rec;
-    OPJ_UINT32 l_offset;
 
     /* preconditions */
     assert(p_j2k != 00);
@@ -9220,109 +9257,14 @@ static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
     l_image = p_j2k->m_private_image;
     l_nb_tiles = p_j2k->m_cp.th * p_j2k->m_cp.tw;
     l_tcp = p_j2k->m_cp.tcps;
-    l_tccp_size = l_image->numcomps * (OPJ_UINT32)sizeof(opj_tccp_t);
-    l_default_tcp = p_j2k->m_specific_param.m_decoder.m_default_tcp;
-    l_mct_size = l_image->numcomps * l_image->numcomps * (OPJ_UINT32)sizeof(
-                     OPJ_FLOAT32);
 
-    /* For each tile */
+    /* The parameters of a tile are copied from the decoding tile parameters
+     * when the tile appears in the codestream (opj_j2k_read_sot), so a header
+     * that declares many tiles costs no copy for tiles that never come. Until
+     * then, the tile parameters read as a copy would before its first tile-part:
+     * no data, no tile-part read yet. */
     for (i = 0; i < l_nb_tiles; ++i) {
-        /* keep the tile-compo coding parameters pointer of the current tile coding parameters*/
-        l_current_tccp = l_tcp->tccps;
-        /*Copy default coding parameters into the current tile coding parameters*/
-        memcpy(l_tcp, l_default_tcp, sizeof(opj_tcp_t));
-        /* Initialize some values of the current tile coding parameters*/
-        l_tcp->cod = 0;
-        l_tcp->ppt = 0;
-        l_tcp->ppt_data = 00;
         l_tcp->m_current_tile_part_number = -1;
-        /* Remove memory not owned by this tile in case of early error return. */
-        l_tcp->m_mct_decoding_matrix = 00;
-        l_tcp->m_nb_max_mct_records = 0;
-        l_tcp->m_mct_records = 00;
-        l_tcp->m_nb_max_mcc_records = 0;
-        l_tcp->m_mcc_records = 00;
-        /* Reconnect the tile-compo coding parameters pointer to the current tile coding parameters*/
-        l_tcp->tccps = l_current_tccp;
-
-        /* Get the mct_decoding_matrix of the dflt_tile_cp and copy them into the current tile cp*/
-        if (l_default_tcp->m_mct_decoding_matrix) {
-            l_tcp->m_mct_decoding_matrix = (OPJ_FLOAT32*)opj_malloc(l_mct_size);
-            if (! l_tcp->m_mct_decoding_matrix) {
-                return OPJ_FALSE;
-            }
-            memcpy(l_tcp->m_mct_decoding_matrix, l_default_tcp->m_mct_decoding_matrix,
-                   l_mct_size);
-        }
-
-        /* Get the mct_record of the dflt_tile_cp and copy them into the current tile cp*/
-        l_mct_records_size = l_default_tcp->m_nb_max_mct_records * (OPJ_UINT32)sizeof(
-                                 opj_mct_data_t);
-        l_tcp->m_mct_records = (opj_mct_data_t*)opj_malloc(l_mct_records_size);
-        if (! l_tcp->m_mct_records) {
-            return OPJ_FALSE;
-        }
-        memcpy(l_tcp->m_mct_records, l_default_tcp->m_mct_records, l_mct_records_size);
-
-        /* Copy the mct record data from dflt_tile_cp to the current tile*/
-        l_src_mct_rec = l_default_tcp->m_mct_records;
-        l_dest_mct_rec = l_tcp->m_mct_records;
-
-        for (j = 0; j < l_default_tcp->m_nb_mct_records; ++j) {
-
-            if (l_src_mct_rec->m_data) {
-
-                l_dest_mct_rec->m_data = (OPJ_BYTE*) opj_malloc(l_src_mct_rec->m_data_size);
-                if (! l_dest_mct_rec->m_data) {
-                    return OPJ_FALSE;
-                }
-                memcpy(l_dest_mct_rec->m_data, l_src_mct_rec->m_data,
-                       l_src_mct_rec->m_data_size);
-            }
-
-            ++l_src_mct_rec;
-            ++l_dest_mct_rec;
-            /* Update with each pass to free exactly what has been allocated on early return. */
-            l_tcp->m_nb_max_mct_records += 1;
-        }
-
-        /* Get the mcc_record of the dflt_tile_cp and copy them into the current tile cp*/
-        l_mcc_records_size = l_default_tcp->m_nb_max_mcc_records * (OPJ_UINT32)sizeof(
-                                 opj_simple_mcc_decorrelation_data_t);
-        l_tcp->m_mcc_records = (opj_simple_mcc_decorrelation_data_t*) opj_malloc(
-                                   l_mcc_records_size);
-        if (! l_tcp->m_mcc_records) {
-            return OPJ_FALSE;
-        }
-        memcpy(l_tcp->m_mcc_records, l_default_tcp->m_mcc_records, l_mcc_records_size);
-        l_tcp->m_nb_max_mcc_records = l_default_tcp->m_nb_max_mcc_records;
-
-        /* Copy the mcc record data from dflt_tile_cp to the current tile*/
-        l_src_mcc_rec = l_default_tcp->m_mcc_records;
-        l_dest_mcc_rec = l_tcp->m_mcc_records;
-
-        for (j = 0; j < l_default_tcp->m_nb_max_mcc_records; ++j) {
-
-            if (l_src_mcc_rec->m_decorrelation_array) {
-                l_offset = (OPJ_UINT32)(l_src_mcc_rec->m_decorrelation_array -
-                                        l_default_tcp->m_mct_records);
-                l_dest_mcc_rec->m_decorrelation_array = l_tcp->m_mct_records + l_offset;
-            }
-
-            if (l_src_mcc_rec->m_offset_array) {
-                l_offset = (OPJ_UINT32)(l_src_mcc_rec->m_offset_array -
-                                        l_default_tcp->m_mct_records);
-                l_dest_mcc_rec->m_offset_array = l_tcp->m_mct_records + l_offset;
-            }
-
-            ++l_src_mcc_rec;
-            ++l_dest_mcc_rec;
-        }
-
-        /* Copy all the dflt_tile_compo_cp to the current tile cp */
-        memcpy(l_current_tccp, l_default_tcp->tccps, l_tccp_size);
-
-        /* Move to next tile cp*/
         ++l_tcp;
     }
 
@@ -9338,6 +9280,144 @@ static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
         opj_event_msg(p_manager, EVT_ERROR, "Cannot decode tile, memory error\n");
         return OPJ_FALSE;
     }
+
+    return OPJ_TRUE;
+}
+
+static OPJ_BOOL opj_j2k_init_tile_parameters(opj_j2k_t * p_j2k,
+        OPJ_UINT32 p_tile_no,
+        opj_event_mgr_t * p_manager)
+{
+    opj_tcp_t * l_tcp = 00;
+    opj_tcp_t * l_default_tcp = 00;
+    OPJ_UINT32 j;
+    opj_tccp_t *l_current_tccp = 00;
+    OPJ_UINT32 l_tccp_size;
+    OPJ_UINT32 l_mct_size;
+    opj_image_t * l_image;
+    OPJ_UINT32 l_mcc_records_size, l_mct_records_size;
+    opj_mct_data_t * l_src_mct_rec, *l_dest_mct_rec;
+    opj_simple_mcc_decorrelation_data_t * l_src_mcc_rec, *l_dest_mcc_rec;
+    OPJ_UINT32 l_offset;
+
+    /* preconditions */
+    assert(p_j2k != 00);
+    assert(p_manager != 00);
+    assert(p_tile_no < p_j2k->m_cp.th * p_j2k->m_cp.tw);
+
+    l_tcp = &(p_j2k->m_cp.tcps[p_tile_no]);
+    if (l_tcp->tccps != 00) {
+        /* done when an earlier tile-part of this tile was read */
+        return OPJ_TRUE;
+    }
+
+    l_image = p_j2k->m_private_image;
+    l_tccp_size = l_image->numcomps * (OPJ_UINT32)sizeof(opj_tccp_t);
+    l_default_tcp = p_j2k->m_specific_param.m_decoder.m_default_tcp;
+    l_mct_size = l_image->numcomps * l_image->numcomps * (OPJ_UINT32)sizeof(
+                     OPJ_FLOAT32);
+
+    /* the tile-compo coding parameters of the current tile coding parameters */
+    l_current_tccp = (opj_tccp_t*) opj_calloc(l_image->numcomps,
+                     sizeof(opj_tccp_t));
+    if (l_current_tccp == 00) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Not enough memory to take in charge the tile parameters\n");
+        return OPJ_FALSE;
+    }
+
+    /*Copy default coding parameters into the current tile coding parameters*/
+    memcpy(l_tcp, l_default_tcp, sizeof(opj_tcp_t));
+    /* Initialize some values of the current tile coding parameters*/
+    l_tcp->cod = 0;
+    l_tcp->ppt = 0;
+    l_tcp->ppt_data = 00;
+    l_tcp->m_current_tile_part_number = -1;
+    /* Remove memory not owned by this tile in case of early error return. */
+    l_tcp->m_mct_decoding_matrix = 00;
+    l_tcp->m_nb_max_mct_records = 0;
+    l_tcp->m_mct_records = 00;
+    l_tcp->m_nb_max_mcc_records = 0;
+    l_tcp->m_mcc_records = 00;
+    /* Connect the tile-compo coding parameters pointer to the current tile coding parameters*/
+    l_tcp->tccps = l_current_tccp;
+
+    /* Get the mct_decoding_matrix of the dflt_tile_cp and copy them into the current tile cp*/
+    if (l_default_tcp->m_mct_decoding_matrix) {
+        l_tcp->m_mct_decoding_matrix = (OPJ_FLOAT32*)opj_malloc(l_mct_size);
+        if (! l_tcp->m_mct_decoding_matrix) {
+            return OPJ_FALSE;
+        }
+        memcpy(l_tcp->m_mct_decoding_matrix, l_default_tcp->m_mct_decoding_matrix,
+               l_mct_size);
+    }
+
+    /* Get the mct_record of the dflt_tile_cp and copy them into the current tile cp*/
+    l_mct_records_size = l_default_tcp->m_nb_max_mct_records * (OPJ_UINT32)sizeof(
+                             opj_mct_data_t);
+    l_tcp->m_mct_records = (opj_mct_data_t*)opj_malloc(l_mct_records_size);
+    if (! l_tcp->m_mct_records) {
+        return OPJ_FALSE;
+    }
+    memcpy(l_tcp->m_mct_records, l_default_tcp->m_mct_records, l_mct_records_size);
+
+    /* Copy the mct record data from dflt_tile_cp to the current tile*/
+    l_src_mct_rec = l_default_tcp->m_mct_records;
+    l_dest_mct_rec = l_tcp->m_mct_records;
+
+    for (j = 0; j < l_default_tcp->m_nb_mct_records; ++j) {
+
+        if (l_src_mct_rec->m_data) {
+
+            l_dest_mct_rec->m_data = (OPJ_BYTE*) opj_malloc(l_src_mct_rec->m_data_size);
+            if (! l_dest_mct_rec->m_data) {
+                return OPJ_FALSE;
+            }
+            memcpy(l_dest_mct_rec->m_data, l_src_mct_rec->m_data,
+                   l_src_mct_rec->m_data_size);
+        }
+
+        ++l_src_mct_rec;
+        ++l_dest_mct_rec;
+        /* Update with each pass to free exactly what has been allocated on early return. */
+        l_tcp->m_nb_max_mct_records += 1;
+    }
+
+    /* Get the mcc_record of the dflt_tile_cp and copy them into the current tile cp*/
+    l_mcc_records_size = l_default_tcp->m_nb_max_mcc_records * (OPJ_UINT32)sizeof(
+                             opj_simple_mcc_decorrelation_data_t);
+    l_tcp->m_mcc_records = (opj_simple_mcc_decorrelation_data_t*) opj_malloc(
+                               l_mcc_records_size);
+    if (! l_tcp->m_mcc_records) {
+        return OPJ_FALSE;
+    }
+    memcpy(l_tcp->m_mcc_records, l_default_tcp->m_mcc_records, l_mcc_records_size);
+    l_tcp->m_nb_max_mcc_records = l_default_tcp->m_nb_max_mcc_records;
+
+    /* Copy the mcc record data from dflt_tile_cp to the current tile*/
+    l_src_mcc_rec = l_default_tcp->m_mcc_records;
+    l_dest_mcc_rec = l_tcp->m_mcc_records;
+
+    for (j = 0; j < l_default_tcp->m_nb_max_mcc_records; ++j) {
+
+        if (l_src_mcc_rec->m_decorrelation_array) {
+            l_offset = (OPJ_UINT32)(l_src_mcc_rec->m_decorrelation_array -
+                                    l_default_tcp->m_mct_records);
+            l_dest_mcc_rec->m_decorrelation_array = l_tcp->m_mct_records + l_offset;
+        }
+
+        if (l_src_mcc_rec->m_offset_array) {
+            l_offset = (OPJ_UINT32)(l_src_mcc_rec->m_offset_array -
+                                    l_default_tcp->m_mct_records);
+            l_dest_mcc_rec->m_offset_array = l_tcp->m_mct_records + l_offset;
+        }
+
+        ++l_src_mcc_rec;
+        ++l_dest_mcc_rec;
+    }
+
+    /* Copy all the dflt_tile_compo_cp to the current tile cp */
+    memcpy(l_current_tccp, l_default_tcp->tccps, l_tccp_size);
 
     return OPJ_TRUE;
 }
@@ -11509,7 +11589,11 @@ void j2k_dump(opj_j2k_t* p_j2k, OPJ_INT32 flag, FILE* out_stream)
         opj_tcp_t * l_tcp = p_j2k->m_cp.tcps;
         if (p_j2k->m_private_image) {
             for (i = 0; i < l_nb_tiles; ++i) {
-                opj_j2k_dump_tile_info(l_tcp, (OPJ_INT32)p_j2k->m_private_image->numcomps,
+                /* a tile that has not appeared yet has the decoding tile
+                 * parameters, which it receives when it appears */
+                opj_j2k_dump_tile_info(l_tcp->tccps ? l_tcp :
+                                       p_j2k->m_specific_param.m_decoder.m_default_tcp,
+                                       (OPJ_INT32)p_j2k->m_private_image->numcomps,
                                        out_stream);
                 ++l_tcp;
             }
@@ -11879,8 +11963,6 @@ opj_codestream_index_t* j2k_get_cstr_index(opj_j2k_t* p_j2k)
 
 static OPJ_BOOL opj_j2k_allocate_tile_element_cstr_index(opj_j2k_t *p_j2k)
 {
-    OPJ_UINT32 it_tile = 0;
-
     p_j2k->cstr_index->nb_of_tiles = p_j2k->m_cp.tw * p_j2k->m_cp.th;
     p_j2k->cstr_index->tile_index = (opj_tile_index_t*)opj_calloc(
                                         p_j2k->cstr_index->nb_of_tiles, sizeof(opj_tile_index_t));
@@ -11888,16 +11970,9 @@ static OPJ_BOOL opj_j2k_allocate_tile_element_cstr_index(opj_j2k_t *p_j2k)
         return OPJ_FALSE;
     }
 
-    for (it_tile = 0; it_tile < p_j2k->cstr_index->nb_of_tiles; it_tile++) {
-        p_j2k->cstr_index->tile_index[it_tile].maxmarknum = 100;
-        p_j2k->cstr_index->tile_index[it_tile].marknum = 0;
-        p_j2k->cstr_index->tile_index[it_tile].marker = (opj_marker_info_t*)
-                opj_calloc(p_j2k->cstr_index->tile_index[it_tile].maxmarknum,
-                           sizeof(opj_marker_info_t));
-        if (!p_j2k->cstr_index->tile_index[it_tile].marker) {
-            return OPJ_FALSE;
-        }
-    }
+    /* The marker list of a tile (marker, marknum, maxmarknum: zero from calloc)
+     * is allocated by opj_j2k_add_tlmarker when the tile's first marker is read,
+     * so tiles that do not appear in the codestream cost no list */
 
     return OPJ_TRUE;
 }
@@ -12385,6 +12460,33 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
     return OPJ_TRUE;
 }
 
+/**
+ * Checks the size of every component of the image to decode, at the decoded
+ * resolution, against the decoder's max_decoded_side limit.
+ */
+static OPJ_BOOL opj_j2k_check_decoded_side(const opj_j2k_t * p_j2k,
+        const opj_image_t * p_image,
+        opj_event_mgr_t * p_manager)
+{
+    const OPJ_UINT32 l_max_side =
+        p_j2k->m_cp.m_specific_param.m_dec.m_limits.max_decoded_side;
+    OPJ_UINT32 compno;
+
+    if (l_max_side == 0U) {
+        return OPJ_TRUE;
+    }
+    for (compno = 0; compno < p_image->numcomps; ++compno) {
+        const opj_image_comp_t * l_comp = &(p_image->comps[compno]);
+        if (l_comp->w > l_max_side || l_comp->h > l_max_side) {
+            opj_event_msg(p_manager, EVT_ERROR,
+                          "Component %u decodes to %u x %u samples, more than the decoder's limit of %u per side\n",
+                          compno, l_comp->w, l_comp->h, l_max_side);
+            return OPJ_FALSE;
+        }
+    }
+    return OPJ_TRUE;
+}
+
 OPJ_BOOL opj_j2k_decode(opj_j2k_t * p_j2k,
                         opj_stream_private_t * p_stream,
                         opj_image_t * p_image,
@@ -12417,6 +12519,10 @@ OPJ_BOOL opj_j2k_decode(opj_j2k_t * p_j2k,
         if (!opj_j2k_update_image_dimensions(p_image, p_manager)) {
             return OPJ_FALSE;
         }
+    }
+
+    if (!opj_j2k_check_decoded_side(p_j2k, p_image, p_manager)) {
+        return OPJ_FALSE;
     }
 
     if (p_j2k->m_output_image == NULL) {
@@ -12524,6 +12630,10 @@ OPJ_BOOL opj_j2k_get_tile(opj_j2k_t *p_j2k,
             p_image->comps[compno].data = NULL;
         }
         p_image->numcomps = p_j2k->m_private_image->numcomps;
+    }
+
+    if (!opj_j2k_check_decoded_side(p_j2k, p_image, p_manager)) {
+        return OPJ_FALSE;
     }
 
     /* Destroy the previous output image*/

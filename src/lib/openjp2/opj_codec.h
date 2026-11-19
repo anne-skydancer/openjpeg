@@ -93,6 +93,10 @@ typedef struct opj_codec_private {
             /** Strict mode function handler */
             void (*opj_decoder_set_strict_mode)(void * p_codec, OPJ_BOOL strict);
 
+            /** Decoder limits function handler */
+            void (*opj_decoder_set_limits)(void * p_codec,
+                                           const opj_decoder_limits_t * p_limits);
+
             /** Set decode area function handler */
             OPJ_BOOL(*opj_set_decode_area)(void * p_codec,
                                            opj_image_t * p_image,

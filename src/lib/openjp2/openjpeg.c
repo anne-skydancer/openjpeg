@@ -181,6 +181,19 @@ const char* OPJ_CALLCONV opj_version(void)
 /* ---------------------------------------------------------------------- */
 /* DECOMPRESSION FUNCTIONS*/
 
+/* Handlers with the exact type of their table entry (no call through a cast) */
+static void opj_j2k_decoder_set_limits_handler(void * p_codec,
+        const opj_decoder_limits_t * p_limits)
+{
+    opj_j2k_decoder_set_limits((opj_j2k_t *)p_codec, p_limits);
+}
+
+static void opj_jp2_decoder_set_limits_handler(void * p_codec,
+        const opj_decoder_limits_t * p_limits)
+{
+    opj_jp2_decoder_set_limits((opj_jp2_t *)p_codec, p_limits);
+}
+
 opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
 {
     opj_codec_private_t *l_codec = 00;
@@ -227,6 +240,8 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
         l_codec->m_codec_data.m_decompression.opj_decoder_set_strict_mode =
             (void (*)(void *, OPJ_BOOL)) opj_j2k_decoder_set_strict_mode;
 
+        l_codec->m_codec_data.m_decompression.opj_decoder_set_limits =
+            opj_j2k_decoder_set_limits_handler;
 
         l_codec->m_codec_data.m_decompression.opj_read_tile_header =
             (OPJ_BOOL(*)(void *,
@@ -337,6 +352,9 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
 
         l_codec->m_codec_data.m_decompression.opj_decoder_set_strict_mode =
             (void (*)(void *, OPJ_BOOL)) opj_jp2_decoder_set_strict_mode;
+
+        l_codec->m_codec_data.m_decompression.opj_decoder_set_limits =
+            opj_jp2_decoder_set_limits_handler;
 
         l_codec->m_codec_data.m_decompression.opj_set_decode_area =
             (OPJ_BOOL(*)(void *,
@@ -453,6 +471,52 @@ OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
         l_codec->m_codec_data.m_decompression.opj_decoder_set_strict_mode(
             l_codec->m_codec,
             strict);
+        return OPJ_TRUE;
+    }
+    return OPJ_FALSE;
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_decoder_limits_init(opj_decoder_limits_t *p_limits,
+        OPJ_UINT32 profile)
+{
+    if (!p_limits) {
+        return OPJ_FALSE;
+    }
+    memset(p_limits, 0, sizeof(opj_decoder_limits_t));
+    switch (profile) {
+    case OPJ_DECODER_LIMITS_NONE:
+        return OPJ_TRUE;
+    case OPJ_DECODER_LIMITS_SL_TEXTURE:
+        /* The caps follow the viewer's own rules (at most 8 components, 2048 pixels
+         * per side at the decoded resolution, 256 MiB for a raw image) and bound what
+         * a hostile header can make the decoder allocate: about 6 MB of tile
+         * parameters for 1,024 tiles, 128 MiB of samples (2048 x 2048 x 8 x 4 bytes)
+         * at the decoded resolution, and 256 MiB for the decode of one tile. They are
+         * far above the textures Second Life serves (one tile, up to 5 components). */
+        p_limits->max_tiles = 1024;
+        p_limits->max_components = 8;
+        p_limits->max_decoded_side = 2048;
+        p_limits->max_memory = (OPJ_UINT64)256 * 1024 * 1024;
+        return OPJ_TRUE;
+    default:
+        return OPJ_FALSE;
+    }
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_decoder_set_limits(opj_codec_t *p_codec,
+        const opj_decoder_limits_t *p_limits)
+{
+    if (p_codec && p_limits) {
+        opj_codec_private_t * l_codec = (opj_codec_private_t *) p_codec;
+
+        if (! l_codec->is_decompressor) {
+            opj_event_msg(&(l_codec->m_event_mgr), EVT_ERROR,
+                          "Codec provided to the opj_decoder_set_limits function is not a decompressor handler.\n");
+            return OPJ_FALSE;
+        }
+
+        l_codec->m_codec_data.m_decompression.opj_decoder_set_limits(
+            l_codec->m_codec, p_limits);
         return OPJ_TRUE;
     }
     return OPJ_FALSE;

@@ -348,6 +348,8 @@ typedef struct opj_decoding_param {
     OPJ_UINT32 m_reduce;
     /** if != 0, then only the first "layer" layers are decoded; if == 0 or not used, all the quality layers are decoded */
     OPJ_UINT32 m_layer;
+    /** resource limits (opj_decoder_set_limits); every limit is 0 (none) unless set */
+    opj_decoder_limits_t m_limits;
 }
 opj_decoding_param_t;
 
@@ -665,6 +667,14 @@ Decoding parameters are returned in j2k->cp.
 void opj_j2k_setup_decoder(opj_j2k_t *j2k, opj_dparameters_t *parameters);
 
 void opj_j2k_decoder_set_strict_mode(opj_j2k_t *j2k, OPJ_BOOL strict);
+
+/**
+Set the resource limits of the decoder (see opj_decoder_limits_t).
+@param j2k J2K decompressor handle
+@param p_limits the limits, copied
+*/
+void opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
+                                const opj_decoder_limits_t *p_limits);
 
 OPJ_BOOL opj_j2k_set_threads(opj_j2k_t *j2k, OPJ_UINT32 num_threads);
 

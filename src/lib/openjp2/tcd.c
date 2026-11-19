@@ -794,6 +794,50 @@ OPJ_BOOL opj_alloc_tile_component_data(opj_tcd_tilecomp_t *l_tilec)
 
 /* ----------------------------------------------------------------------- */
 
+/**
+ * Adds the bytes of an allocation to the working memory of a tile decode, and
+ * checks the sum against the decoder's memory limit before the allocation is
+ * made (p_max_memory 0: no limit).
+ */
+static OPJ_BOOL opj_tcd_add_memory(OPJ_UINT64 *p_memory, OPJ_UINT64 p_bytes,
+                                   OPJ_UINT64 p_max_memory,
+                                   opj_event_mgr_t *p_manager)
+{
+    if (p_max_memory == 0U) {
+        return OPJ_TRUE;
+    }
+    if (*p_memory > p_max_memory || p_bytes > p_max_memory - *p_memory) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Decoding the tile needs more memory than the decoder's limit of %"
+                      PRIu64 " bytes\n", p_max_memory);
+        return OPJ_FALSE;
+    }
+    *p_memory += p_bytes;
+    return OPJ_TRUE;
+}
+
+/** a * b, or UINT64_MAX if the product does not fit */
+static OPJ_UINT64 opj_tcd_mul_sat(OPJ_UINT64 a, OPJ_UINT64 b)
+{
+    if (b != 0U && a > (~(OPJ_UINT64)0) / b) {
+        return ~(OPJ_UINT64)0;
+    }
+    return a * b;
+}
+
+/** Bytes of a tag tree of w x h leaves, as opj_tgt_create allocates them */
+static OPJ_UINT64 opj_tcd_tgt_bytes(OPJ_UINT32 w, OPJ_UINT32 h)
+{
+    OPJ_UINT64 n, nodes = 0;
+    do {
+        n = (OPJ_UINT64)w * h;
+        nodes += n;
+        w = (w >> 1) + (w & 1U);
+        h = (h >> 1) + (h & 1U);
+    } while (n > 1);
+    return (OPJ_UINT64)sizeof(opj_tgt_tree_t) + nodes * sizeof(opj_tgt_node_t);
+}
+
 static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
         OPJ_BOOL isEncoder, OPJ_SIZE_T sizeof_block,
         opj_event_mgr_t* manager)
@@ -827,8 +871,17 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
     OPJ_UINT32 l_nb_code_blocks_size;
     /* size of data for a tile */
     OPJ_UINT32 l_data_size;
+    /* decoder memory limit (0: none), and the bytes the decode of this tile
+     * needs, counted before each allocation */
+    OPJ_UINT64 l_max_memory = 0, l_memory = 0;
+    /* most precincts of a resolution and most resolutions of a component:
+     * the packet iterator sizes its table from them */
+    OPJ_UINT32 l_max_prec = 0, l_max_res = 0;
 
     l_cp = p_tcd->cp;
+    if (!isEncoder) {
+        l_max_memory = l_cp->m_specific_param.m_dec.m_limits.max_memory;
+    }
     l_tcp = &(l_cp->tcps[p_tile_no]);
     l_tile = p_tcd->tcd_image->tiles;
     l_tccp = l_tcp->tccps;
@@ -915,6 +968,10 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
 
         l_data_size = l_tilec->numresolutions * (OPJ_UINT32)sizeof(
                           opj_tcd_resolution_t);
+        if (!opj_tcd_add_memory(&l_memory, l_data_size, l_max_memory, manager)) {
+            return OPJ_FALSE;
+        }
+        l_max_res = opj_uint_max(l_max_res, l_tilec->numresolutions);
 
         opj_image_data_free(l_tilec->data_win);
         l_tilec->data_win = NULL;
@@ -1013,6 +1070,17 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
                 return OPJ_FALSE;
             }
             l_nb_precinct_size = l_nb_precincts * (OPJ_UINT32)sizeof(opj_tcd_precinct_t);
+            l_max_prec = opj_uint_max(l_max_prec, l_nb_precincts);
+
+            if (resno + 1U == l_tilec->minimum_num_resolutions) {
+                /* the samples of the decoded resolution (opj_tcd_decode_tile) */
+                if (!opj_tcd_add_memory(&l_memory,
+                                        (OPJ_UINT64)(OPJ_UINT32)(l_res->x1 - l_res->x0) *
+                                        (OPJ_UINT32)(l_res->y1 - l_res->y0) * sizeof(OPJ_INT32),
+                                        l_max_memory, manager)) {
+                    return OPJ_FALSE;
+                }
+            }
 
             if (resno == 0) {
                 tlcbgxstart = l_tl_prc_x_start;
@@ -1095,6 +1163,11 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
                 l_band->numbps = l_step_size->expn + (OPJ_INT32)l_tccp->numgbits -
                                  1;
 
+                if (!opj_tcd_add_memory(&l_memory, l_nb_precinct_size, l_max_memory,
+                                        manager)) {
+                    return OPJ_FALSE;
+                }
+
                 if (!l_band->precincts && (l_nb_precincts > 0U)) {
                     l_band->precincts = (opj_tcd_precinct_t *) opj_malloc(/*3 * */
                                             l_nb_precinct_size);
@@ -1172,6 +1245,18 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
                         return OPJ_FALSE;
                     }
                     l_nb_code_blocks_size = l_nb_code_blocks * (OPJ_UINT32)sizeof_block;
+
+                    /* the code-blocks, their segment arrays and the precinct's two
+                     * tag trees */
+                    if (l_max_memory != 0U && !opj_tcd_add_memory(&l_memory,
+                                            (OPJ_UINT64)l_nb_code_blocks_size +
+                                            (OPJ_UINT64)l_nb_code_blocks * OPJ_J2K_DEFAULT_NB_SEGS *
+                                            sizeof(opj_tcd_seg_t) +
+                                            2U * opj_tcd_tgt_bytes(l_current_precinct->cw,
+                                                    l_current_precinct->ch),
+                                            l_max_memory, manager)) {
+                        return OPJ_FALSE;
+                    }
 
                     if (!l_current_precinct->cblks.blocks && (l_nb_code_blocks > 0U)) {
                         l_current_precinct->cblks.blocks = opj_malloc(l_nb_code_blocks_size);
@@ -1266,6 +1351,18 @@ static INLINE OPJ_BOOL opj_tcd_init_tile(opj_tcd_t *p_tcd, OPJ_UINT32 p_tile_no,
         ++l_tilec;
         ++l_image_comp;
     } /* compno */
+
+    /* the packet iterator's table: (layers + 1) x resolutions x components x
+     * precincts entries of 16 bits (opj_pi_create_decode) */
+    if (l_max_memory != 0U &&
+            !opj_tcd_add_memory(&l_memory,
+                                opj_tcd_mul_sat(opj_tcd_mul_sat(opj_tcd_mul_sat(
+                                        (OPJ_UINT64)l_tcp->numlayers + 1U,
+                                        (OPJ_UINT64)l_max_res * l_image->numcomps), l_max_prec),
+                                        sizeof(OPJ_INT16)),
+                                l_max_memory, manager)) {
+        return OPJ_FALSE;
+    }
     return OPJ_TRUE;
 }
 

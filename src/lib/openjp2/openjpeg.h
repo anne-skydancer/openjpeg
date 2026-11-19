@@ -613,6 +613,45 @@ typedef struct opj_dparameters {
 
 } opj_dparameters_t;
 
+/**
+ * Defined by builds that have opj_decoder_limits_init() and opj_decoder_set_limits()
+ * (a Vulkanstorm addition to OpenJPEG 2.5.4).
+ */
+#define OPJ_HAVE_DECODER_LIMITS 1
+
+/**
+ * Resource limits of a decoder, set with opj_decoder_set_limits().
+ *
+ * The decoder checks each limit from the codestream's headers before it allocates what the
+ * limit bounds, and refuses a codestream that exceeds one: opj_read_header() or opj_decode()
+ * then fails with an error message. A limit of 0 means no limit, and a decoder that is given
+ * no limits behaves as OpenJPEG always did. Fill the structure with opj_decoder_limits_init()
+ * and change single fields afterwards if needed.
+ * */
+typedef struct opj_decoder_limits {
+    /** Tiles of the image (SIZ marker), checked when the main header is read. */
+    OPJ_UINT32 max_tiles;
+    /** Components of the image (SIZ marker), checked when the main header is read. */
+    OPJ_UINT32 max_components;
+    /** Width and height of every component at the decoded resolution, after the reduce
+     * factor, checked when opj_decode() or opj_get_decoded_tile() starts. */
+    OPJ_UINT32 max_decoded_side;
+    /** Bytes the decoder may allocate, checked against two needs computed from the headers,
+     * each on its own: the tile parameters of the whole codestream (when the main header is
+     * read), and the decode of one tile (code-block and precinct structures of every
+     * resolution, samples at the decoded resolution, packet iterator table), checked before
+     * each of those allocations. */
+    OPJ_UINT64 max_memory;
+} opj_decoder_limits_t;
+
+/** No limits: OpenJPEG's own behaviour, the default of every decoder. */
+#define OPJ_DECODER_LIMITS_NONE        0
+/**
+ * Second Life textures: 1,024 tiles, 8 components, 2,048 pixels per side at the decoded
+ * resolution and 256 MiB of working memory.
+ */
+#define OPJ_DECODER_LIMITS_SL_TEXTURE  1
+
 
 /**
  * JPEG2000 codec V2.
@@ -1365,6 +1404,30 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_setup_decoder(opj_codec_t *p_codec,
 
 OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
         OPJ_BOOL strict);
+
+/**
+ * Fills decoder limits with a profile.
+ *
+ * @param p_limits      the limits to fill.
+ * @param profile       OPJ_DECODER_LIMITS_NONE or OPJ_DECODER_LIMITS_SL_TEXTURE.
+ *
+ * @return OPJ_TRUE if the profile is known. With an unknown profile the limits are set to
+ *         OPJ_DECODER_LIMITS_NONE and OPJ_FALSE is returned.
+ */
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_limits_init(
+    opj_decoder_limits_t *p_limits, OPJ_UINT32 profile);
+
+/**
+ * Sets the resource limits of a decoder (see opj_decoder_limits_t).
+ * Call it after opj_setup_decoder() and before opj_read_header(). The limits are copied.
+ *
+ * @param p_codec       decompressor handler
+ * @param p_limits      the limits
+ *
+ * @return OPJ_TRUE if the limits are set
+ */
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_limits(opj_codec_t *p_codec,
+        const opj_decoder_limits_t *p_limits);
 
 /**
  * Allocates worker threads for the compressor/decompressor.
