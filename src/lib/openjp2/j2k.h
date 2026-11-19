@@ -677,9 +677,10 @@ void opj_j2k_decoder_set_strict_mode(opj_j2k_t *j2k, OPJ_BOOL strict);
 Set the resource limits of the decoder (see opj_decoder_limits_t).
 @param j2k J2K decompressor handle
 @param p_limits the limits, copied
+@return OPJ_FALSE after the header was read (the limits are not changed)
 */
-void opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
-                                const opj_decoder_limits_t *p_limits);
+OPJ_BOOL opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
+                                    const opj_decoder_limits_t *p_limits);
 
 OPJ_BOOL opj_j2k_set_threads(opj_j2k_t *j2k, OPJ_UINT32 num_threads);
 

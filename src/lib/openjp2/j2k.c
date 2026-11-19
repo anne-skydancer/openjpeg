@@ -6882,12 +6882,15 @@ void opj_j2k_decoder_set_strict_mode(opj_j2k_t *j2k, OPJ_BOOL strict)
     }
 }
 
-void opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
-                                const opj_decoder_limits_t *p_limits)
+OPJ_BOOL opj_j2k_decoder_set_limits(opj_j2k_t *j2k,
+                                    const opj_decoder_limits_t *p_limits)
 {
-    if (j2k && p_limits) {
-        j2k->m_cp.m_specific_param.m_dec.m_limits = *p_limits;
+    /* after the main header, its limits could no longer be checked */
+    if (!j2k || !p_limits || j2k->m_private_image) {
+        return OPJ_FALSE;
     }
+    j2k->m_cp.m_specific_param.m_dec.m_limits = *p_limits;
+    return OPJ_TRUE;
 }
 
 OPJ_BOOL opj_j2k_set_threads(opj_j2k_t *j2k, OPJ_UINT32 num_threads)

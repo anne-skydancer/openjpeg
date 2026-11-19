@@ -620,7 +620,7 @@ typedef struct opj_dparameters {
 #define OPJ_HAVE_DECODER_LIMITS 1
 
 /**
- * Resource limits of a decoder, set with opj_decoder_set_limits().
+ * Resource limits of a decoder, set with opj_decoder_set_limits() before opj_read_header().
  *
  * The decoder checks each limit from the codestream's headers before it allocates what the
  * limit bounds, and refuses a codestream that exceeds one: opj_read_header() or opj_decode()
@@ -1419,14 +1419,17 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
  * @param profile       OPJ_DECODER_LIMITS_NONE or OPJ_DECODER_LIMITS_SL_TEXTURE.
  *
  * @return OPJ_TRUE if the profile is known. With an unknown profile the limits are set to
- *         OPJ_DECODER_LIMITS_NONE and OPJ_FALSE is returned.
+ *         OPJ_DECODER_LIMITS_NONE and OPJ_FALSE is returned, so a caller that needs the
+ *         limits must check the result.
  */
 OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_limits_init(
     opj_decoder_limits_t *p_limits, OPJ_UINT32 profile);
 
 /**
  * Sets the resource limits of a decoder (see opj_decoder_limits_t).
- * Call it after opj_setup_decoder() and before opj_read_header(). The limits are copied.
+ * Call it after opj_setup_decoder() and before opj_read_header(): limits checked at the
+ * main header would come too late afterwards, so a call after opj_read_header() changes
+ * nothing and fails. The limits are copied.
  *
  * @param p_codec       decompressor handler
  * @param p_limits      the limits

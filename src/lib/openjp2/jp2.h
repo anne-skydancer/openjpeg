@@ -248,9 +248,10 @@ void opj_jp2_decoder_set_strict_mode(opj_jp2_t *jp2, OPJ_BOOL strict);
 Set the resource limits of the decoder (see opj_decoder_limits_t).
 @param jp2 JP2 decompressor handle
 @param p_limits the limits, copied
+@return OPJ_FALSE after the header was read (the limits are not changed)
 */
-void opj_jp2_decoder_set_limits(opj_jp2_t *jp2,
-                                const opj_decoder_limits_t *p_limits);
+OPJ_BOOL opj_jp2_decoder_set_limits(opj_jp2_t *jp2,
+                                    const opj_decoder_limits_t *p_limits);
 
 /** Allocates worker threads for the compressor/decompressor.
  *
