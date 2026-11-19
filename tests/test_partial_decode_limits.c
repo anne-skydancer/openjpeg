@@ -31,6 +31,9 @@
  *               resolutions: signed overflow at dwt.c in the lifting step)
    encode_termall16 TERMALL encodes of 9 to 16 bit samples stay inside their code-block buffers
                (run under AddressSanitizer) and decode to their samples
+   encode_guard_bits the encoder refuses an image whose code-blocks need more bit planes than
+               the guard bits of their band hold, instead of writing a stream that decodes to
+               other samples; every image it encodes round-trips
  */
 
 #include <math.h>
@@ -1278,6 +1281,69 @@ static void test_encode_termall16(void)
     CHECK(encoded >= 40, "only %d of 120 TERMALL encodes of 9 to 16 bit samples succeeded", encoded);
 }
 
+/* neo-j2k OD-6: the encoder gives every band two guard bits and did not check that the
+ * code-blocks fit them. A code-block that needs more bit planes than its band holds got a
+ * negative number of zero bit planes, written as 0, and the stream decoded to other samples
+ * without a message. Now the encoder refuses such an image (the error names GUARD_BITS=), and
+ * every image it does encode decodes to its samples; the refused ones encode with more guard
+ * bits. Low precision signed and unsigned samples, one to five resolutions, the colour
+ * transform, noise and blocks of the two extremes. */
+static void test_encode_guard_bits(void)
+{
+    int prec, sgnd, kind, numres, comps, encoded = 0, refused = 0;
+
+    for (prec = 1; prec <= 8; ++prec) {
+        for (sgnd = 0; sgnd < 2; ++sgnd) {
+            for (kind = 0; kind < 2; ++kind) {
+                for (numres = 1; numres <= 5; ++numres) {
+                    for (comps = 2; comps <= 3; ++comps) {
+                        enc_case_t k;
+                        buffer_t out;
+                        opj_image_t *ref;
+
+                        g_seed = (unsigned)(prec * 97 + sgnd * 31 + kind * 7 + numres * 3 + comps);
+                        memset(&k, 0, sizeof(k));
+                        k.w = 33;
+                        k.h = 31;
+                        k.comps = comps;
+                        k.prec = prec;
+                        k.sgnd = sgnd;
+                        k.kind = kind;
+                        k.numres = numres;
+                        k.cbw = k.cbh = 32;
+                        k.layers = 1;
+                        k.mct = comps == 3 ? 1 : 0;
+                        if (enc_case(&k, &out, &ref)) {
+                            ++encoded;
+                            CHECK(same_as(&out, ref),
+                                  "%d bit %s, kind %d, %d resolutions, %d components: encoded but decodes to other samples",
+                                  prec, sgnd ? "signed" : "unsigned", kind, numres, comps);
+                            free(out.data);
+                        } else {
+                            ++refused;
+                            opj_image_destroy(ref);
+                            k.guard = "GUARD_BITS=7";
+                            if (enc_case(&k, &out, &ref)) {
+                                CHECK(same_as(&out, ref),
+                                      "%d bit %s, kind %d, %d resolutions: 7 guard bits do not round trip",
+                                      prec, sgnd ? "signed" : "unsigned", kind, numres);
+                                free(out.data);
+                            } else {
+                                CHECK(0, "%d bit %s, kind %d, %d resolutions: refused with 7 guard bits",
+                                      prec, sgnd ? "signed" : "unsigned", kind, numres);
+                            }
+                        }
+                        opj_image_destroy(ref);
+                    }
+                }
+            }
+        }
+    }
+    /* the images of the defect are among them, and the common ones are not refused */
+    CHECK(refused > 0, "no image was refused: the guard bit check is not running");
+    CHECK(encoded > refused * 4, "%d of %d images refused", refused, refused + encoded);
+}
+
 int main(int argc, char **argv)
 {
     static const struct {
@@ -1292,6 +1358,7 @@ int main(int argc, char **argv)
         { "cuts", test_cuts },
         { "decode_area", test_decode_area },
         { "encode_termall16", test_encode_termall16 },
+        { "encode_guard_bits", test_encode_guard_bits },
     };
     size_t i;
     int ran = 0;

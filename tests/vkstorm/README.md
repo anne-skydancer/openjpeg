@@ -70,6 +70,13 @@ The ISO/IEC 15444-4 conformance streams come from `uclouvain/openjpeg-data` (`in
   stream that end where each layer's packet data ends, also with packet headers in PPM or PPT; `cuthash`
   of each prefix (with a step longer than the file) gives the cut decodes for `b5_check.py`.
 - `run_mutants_san.sh <list> <probe> <out> [jobs]`: one sanitizer process per damaged codestream.
+- `enc_gate.c` (hotfix 2.5.4-cpu-avx2.5; build it like `probe.c` against a `rel` or `san` library): the encoder
+  gates. `upload` and `cfg` print the hash of the viewer's upload encodes and of nine encoder configurations,
+  `rand8 <n> <seed>` those of random 8-bit encodes: two library builds are byte-identical when the outputs are
+  equal (the encoder refuses, with `fail`, only what it used to encode into a stream that decodes to other
+  samples). `term16 <n> <seed>` is the AddressSanitizer stress of TERMALL encodes of 9 to 16 bit samples, and
+  `guard <n> <seed>` the lossless round trips of low precision images at deep transforms (`guard1` the one of
+  neo-j2k OD-6).
 
 `OPJ_TEST_TMP` names the scratch folder for temporary files (excluded from malware scanning); without
 it the scripts use `TEMP`.

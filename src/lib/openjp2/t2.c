@@ -852,6 +852,23 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
                 cblk = &prc->cblks.enc[cblkno];
 
                 cblk->numpasses = 0;
+                /* The packet header writes the number of bit planes the band holds */
+                /* above the code-block's first, and no less than zero: a code-block */
+                /* that needs more bit planes than the guard bits of its band leave */
+                /* (low precision samples at many resolutions, or a low GUARD_BITS) */
+                /* would be written as if it had exactly the band's, and decode as */
+                /* other samples without any message. Refuse such an image. */
+                if (band->numbps < (OPJ_INT32)cblk->numbps) {
+                    opj_event_msg(p_manager, EVT_ERROR,
+                                  "opj_t2_encode_packet(): a code-block of component %u, resolution %u "
+                                  "needs %u bit planes, its band holds %d with %u guard bits: "
+                                  "the image does not fit, use at least %u guard bits (GUARD_BITS=)\n",
+                                  compno, resno, cblk->numbps, band->numbps,
+                                  tcp->tccps[compno].numgbits,
+                                  tcp->tccps[compno].numgbits +
+                                  (OPJ_UINT32)((OPJ_INT32)cblk->numbps - band->numbps));
+                    return OPJ_FALSE;
+                }
                 opj_tgt_setvalue(prc->imsbtree, cblkno, band->numbps - (OPJ_INT32)cblk->numbps);
             }
         }
