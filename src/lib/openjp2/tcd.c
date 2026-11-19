@@ -1910,9 +1910,9 @@ OPJ_BOOL opj_tcd_encode_tile(opj_tcd_t *p_tcd,
 #ifdef OPJ_HAVE_OPENCL
             if (!opj_opencl_encode_tier1(p_tcd, p_manager))
 #endif
-            if (! opj_tcd_t1_encode(p_tcd)) {
-                return OPJ_FALSE;
-            }
+                if (! opj_tcd_t1_encode(p_tcd)) {
+                    return OPJ_FALSE;
+                }
             /* FIXME _ProfStop(PGROUP_T1); */
 
         }
