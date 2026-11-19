@@ -166,6 +166,16 @@ Leave out the passes a packet header announced for the code-blocks of one precin
 static void opj_t2_drop_new_passes(opj_tcd_resolution_t *res,
                                    OPJ_UINT32 precno);
 
+/**
+The source of the packet headers (the tile's data, or the packed headers of PPM or
+PPT) ended inside a packet header or before its EPH marker: what is left of it
+counts as read, so that no later packet reads the same bytes again.
+@param p_header_data_start  Start of the unread packet headers, moved to their end
+@param p_modified_length    Length of the unread packet headers, set to 0
+*/
+static void opj_t2_consume_header_source(OPJ_BYTE **p_header_data_start,
+        OPJ_UINT32 *p_modified_length);
+
 /*@}*/
 
 /*@}*/
@@ -1094,6 +1104,13 @@ static void opj_t2_drop_new_passes(opj_tcd_resolution_t *res,
     }
 }
 
+static void opj_t2_consume_header_source(OPJ_BYTE **p_header_data_start,
+        OPJ_UINT32 *p_modified_length)
+{
+    *p_header_data_start += *p_modified_length;
+    *p_modified_length = 0;
+}
+
 static OPJ_BOOL opj_t2_skip_packet(opj_t2_t* p_t2,
                                    opj_tcd_tile_t *p_tile,
                                    opj_tcp_t *p_tcp,
@@ -1261,7 +1278,8 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
 
         if (l_cut && !l_cp->strict) {
             /* The data ended inside this packet header: the packet is absent, and the
-             * rest of the tile's data counts as read */
+             * rest of the tile's data and of the packet headers counts as read */
+            opj_t2_consume_header_source(l_header_data_start, l_modified_length_ptr);
             *p_is_data_present = OPJ_FALSE;
             *p_data_read = p_max_length;
             return OPJ_TRUE;
@@ -1274,7 +1292,10 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
                     *l_header_data_start)) < 2U) {
                 if (!l_cp->strict) {
                     /* The data ended before the EPH marker: the packet is
-                     * absent, and the rest of the tile's data counts as read */
+                     * absent, and the rest of the tile's data and of the
+                     * packet headers counts as read */
+                    opj_t2_consume_header_source(l_header_data_start,
+                                                 l_modified_length_ptr);
                     *p_is_data_present = OPJ_FALSE;
                     *p_data_read = p_max_length;
                     return OPJ_TRUE;
@@ -1453,9 +1474,10 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
              * end, or the stuffed byte after 0xFF is missing). Header bits past the end
              * read as zeros and could announce passes that have no data: the packet is
              * absent, everything earlier packets gave stays, and the rest of the tile's
-             * data counts as read */
+             * data and of the packet headers counts as read */
             opj_bio_destroy(l_bio);
             opj_t2_drop_new_passes(l_res, p_pi->precno);
+            opj_t2_consume_header_source(l_header_data_start, l_modified_length_ptr);
             *p_is_data_present = OPJ_FALSE;
             *p_data_read = p_max_length;
             return OPJ_TRUE;
@@ -1477,8 +1499,10 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
             if (!l_cp->strict) {
                 /* The data ended before the EPH marker: the passes this header
                  * announced have no data, the packet is absent, and the rest of
-                 * the tile's data counts as read */
+                 * the tile's data and of the packet headers counts as read */
                 opj_t2_drop_new_passes(l_res, p_pi->precno);
+                opj_t2_consume_header_source(l_header_data_start,
+                                             l_modified_length_ptr);
                 *p_is_data_present = OPJ_FALSE;
                 *p_data_read = p_max_length;
                 return OPJ_TRUE;
