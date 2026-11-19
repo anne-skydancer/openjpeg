@@ -2910,6 +2910,15 @@ static OPJ_BOOL opj_dwt_decode_partial_tile(
         return OPJ_FALSE;
     }
 
+    /* The windowed passes load only the samples of the window (the interleave */
+    /* and the sparse array reads write nothing else), but the lifting steps */
+    /* read the neighbours of the edge samples, the unused lanes of the last */
+    /* group of columns, and the samples the window clipping leaves out. */
+    /* Start from zero so that all of these are defined: the result of the */
+    /* window does not depend on them, but their read must not be of */
+    /* uninitialised memory (and, as signed 32 bit sums, must not overflow). */
+    memset(h.mem, 0, h_mem_size);
+
     v.mem = h.mem;
 
     for (resno = 1; resno < numres; resno ++) {
@@ -3902,6 +3911,9 @@ OPJ_BOOL opj_dwt_decode_partial_97(opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
         opj_sparse_array_int32_free(sa);
         return OPJ_FALSE;
     }
+    /* See opj_dwt_decode_partial_tile: samples the windowed passes do not load */
+    /* are read by the lifting steps, so they start defined. */
+    memset(h.wavelet, 0, l_data_size * sizeof(opj_v8_t));
     v.wavelet = h.wavelet;
 
     for (resno = 1; resno < numres; resno ++) {

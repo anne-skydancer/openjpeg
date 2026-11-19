@@ -5,7 +5,8 @@
  * codestream is encoded or written in memory, except for ppt_layers, which reads
  * a stream of the conformance data.
  *
- * usage: test_partial_decode_limits [test]   (no test: all of them but ppt_layers)
+ * usage: test_partial_decode_limits [test]   (no test: all of them but ppt_layers
+ *        and decode_area_iso)
  *        test_partial_decode_limits ppt_layers <p1_02.j2k>
  *   ppt_layers  every cut at a layer boundary of the conformance stream p1_02.j2k
  *               (packet headers in PPT) decodes as the whole file limited to
@@ -20,6 +21,14 @@
  *               the decode stays short and equals the in-band case
  *   cuts        every cut of small layer-progressive codestreams decodes, and
  *               every layer-limited decode of the whole file is one of them
+ *   decode_area_iso <p0_12.j2k>  the same for every window of the conformance
+ *               stream p0_12.j2k
+ *   decode_area every window set with opj_set_decode_area decodes to the same
+ *               samples as that window cut out of the whole image (5/3 exactly,
+ *               9/7 within one level); run under AddressSanitizer and
+ *               UndefinedBehaviorSanitizer it catches the windowed inverse DWT
+ *               reading samples it never loaded (ISO p0_12.j2k, 3 x 5, 4
+ *               resolutions: signed overflow at dwt.c in the lifting step)
  */
 
 #include <math.h>
@@ -941,6 +950,143 @@ static void test_ppt_layers(const char *path)
     free(in.data);
 }
 
+/* Decodes the window [x0,x1) x [y0,y1) of the whole-resolution image */
+static opj_image_t *decode_window(const buffer_t *in, unsigned x0, unsigned y0,
+                                  unsigned x1, unsigned y1)
+{
+    opj_dparameters_t p;
+    opj_codec_t *c;
+    opj_stream_t *s;
+    opj_image_t *img = NULL;
+    buffer_t view = *in;
+    int ok = 0;
+
+    opj_set_default_decoder_parameters(&p);
+    c = opj_create_decompress(OPJ_CODEC_J2K);
+    opj_set_info_handler(c, quiet, NULL);
+    opj_set_warning_handler(c, quiet, NULL);
+    opj_set_error_handler(c, quiet, NULL);
+    opj_setup_decoder(c, &p);
+    s = mem_stream(&view, OPJ_TRUE);
+    if (opj_read_header(s, c, &img) &&
+            opj_set_decode_area(c, img, (OPJ_INT32)x0, (OPJ_INT32)y0,
+                                (OPJ_INT32)x1, (OPJ_INT32)y1) &&
+            opj_decode(c, s, img) && img->numcomps) {
+        ok = 1;
+    }
+    if (!ok) {
+        opj_image_destroy(img);
+        img = NULL;
+    }
+    opj_stream_destroy(s);
+    opj_destroy_codec(c);
+    return img;
+}
+
+static void check_windows(const char *name, const buffer_t *in, int irreversible,
+                          unsigned step)
+{
+    int stage;
+    opj_image_t *full = decode(in, in->size, 0, 0, 1, NULL, OPJ_CODEC_J2K, &stage);
+    unsigned w, h, x0, y0, x1, y1, n = 0;
+
+    CHECK(full != NULL, "%s: whole decode failed", name);
+    if (!full) {
+        return;
+    }
+    w = full->comps[0].w; /* one tile at the origin, components not subsampled */
+    h = full->comps[0].h;
+    for (y0 = 0; y0 < h; y0 += step) {
+        for (x0 = 0; x0 < w; x0 += step) {
+            for (y1 = y0 + 1; y1 <= h; y1 += step) {
+                for (x1 = x0 + 1; x1 <= w; x1 += step) {
+                    opj_image_t *win = decode_window(in, x0, y0, x1, y1);
+                    OPJ_UINT32 i;
+                    unsigned x, y;
+                    int bad = 0;
+                    ++n;
+                    if (!win) {
+                        CHECK(0, "%s: window %u,%u,%u,%u did not decode", name, x0, y0, x1, y1);
+                        continue;
+                    }
+                    for (i = 0; i < win->numcomps && !bad; ++i) {
+                        const opj_image_comp_t *c = &win->comps[i];
+                        if (c->w != x1 - x0 || c->h != y1 - y0) {
+                            bad = 1;
+                            break;
+                        }
+                        for (y = 0; y < c->h && !bad; ++y) {
+                            for (x = 0; x < c->w; ++x) {
+                                const int d = c->data[(size_t)y * c->w + x] -
+                                              full->comps[i].data[(size_t)(y0 + y) * w + x0 + x];
+                                if (irreversible ? (d > 1 || d < -1) : d != 0) {
+                                    bad = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    CHECK(!bad, "%s: window %u,%u,%u,%u differs from the cut-out of the whole image",
+                          name, x0, y0, x1, y1);
+                    opj_image_destroy(win);
+                }
+            }
+        }
+    }
+    CHECK(n > 0, "%s: no window tested", name);
+    opj_image_destroy(full);
+}
+
+static void test_decode_area(void)
+{
+    static const struct {
+        const char *name;
+        int w, h, comps, numres, layers, irreversible;
+        unsigned step;
+    } cfg[] = {
+        /* the geometry of ISO p0_12.j2k, every window */
+        /* (the encoder allows log2(min side) + 1 resolutions at most; the 4
+         * resolutions of the 3 x 5 stream come with the conformance file) */
+        { "3x5 5/3 2 res", 3, 5, 1, 2, 1, 0, 1 },
+        { "5x3 5/3 2 res", 5, 3, 1, 2, 1, 0, 1 },
+        { "7x9 5/3 3 res", 7, 9, 1, 3, 1, 0, 1 },
+        { "37x29 5/3 5 res", 37, 29, 1, 5, 1, 0, 3 },
+        { "40x33 5/3 RGB 4 res", 40, 33, 3, 4, 2, 0, 5 },
+        { "3x5 9/7 2 res", 3, 5, 1, 2, 1, 1, 1 },
+        { "37x29 9/7 5 res", 37, 29, 1, 5, 1, 1, 3 },
+    };
+    size_t i;
+    for (i = 0; i < sizeof(cfg) / sizeof(cfg[0]); ++i) {
+        buffer_t b = encode(cfg[i].w, cfg[i].h, cfg[i].comps, cfg[i].numres,
+                            cfg[i].layers, cfg[i].irreversible, 0);
+        check_windows(cfg[i].name, &b, cfg[i].irreversible, cfg[i].step);
+        free(b.data);
+    }
+}
+
+/* ISO/IEC 15444-4 p0_12.j2k (conformance data): 3 x 5, one component, 4
+ * resolutions, 5/3. Every window. */
+static void test_decode_area_iso(const char *path)
+{
+    buffer_t in;
+    FILE *f = fopen(path, "rb");
+    long n;
+
+    memset(&in, 0, sizeof(in));
+    if (!f) {
+        fprintf(stderr, "cannot read %s\n", path);
+        exit(2);
+    }
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf_reserve(&in, (size_t)n);
+    in.size = fread(in.data, 1, (size_t)n, f);
+    fclose(f);
+    check_windows("p0_12.j2k", &in, 0, 1);
+    free(in.data);
+}
+
 int main(int argc, char **argv)
 {
     static const struct {
@@ -953,10 +1099,15 @@ int main(int argc, char **argv)
         { "psot0", test_psot0 },
         { "packed", test_packed },
         { "cuts", test_cuts },
+        { "decode_area", test_decode_area },
     };
     size_t i;
     int ran = 0;
 
+    if (argc >= 3 && !strcmp(argv[1], "decode_area_iso")) {
+        test_decode_area_iso(argv[2]);
+        ++ran;
+    }
     if (argc >= 3 && !strcmp(argv[1], "ppt_layers")) {
         test_ppt_layers(argv[2]);
         ++ran;

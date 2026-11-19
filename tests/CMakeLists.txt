@@ -94,7 +94,7 @@ add_test(NAME rta_interleaved_tile_parts COMMAND test_tile_part_interleaved)
 # limits (self-contained but for tpdl_ppt_layers).
 add_executable(test_partial_decode_limits test_partial_decode_limits.c)
 target_link_libraries(test_partial_decode_limits ${OPENJPEG_LIBRARY_NAME})
-foreach(tpdl_test setfactor limits_api limits psot0 packed cuts)
+foreach(tpdl_test setfactor limits_api limits psot0 packed cuts decode_area)
   add_test(NAME tpdl_${tpdl_test} COMMAND test_partial_decode_limits ${tpdl_test})
 endforeach()
 # With the test data: the conformance stream whose packet headers are in PPT
@@ -102,6 +102,12 @@ endforeach()
 if(EXISTS "${OPJ_DATA_ROOT}/input/conformance/p1_02.j2k")
   add_test(NAME tpdl_ppt_layers COMMAND test_partial_decode_limits ppt_layers
     ${OPJ_DATA_ROOT}/input/conformance/p1_02.j2k)
+endif()
+# The conformance stream p0_12.j2k (3 x 5, four resolutions), every decode area:
+# the windowed inverse transform read samples it never loaded.
+if(EXISTS "${OPJ_DATA_ROOT}/input/conformance/p0_12.j2k")
+  add_test(NAME tpdl_decode_area_iso COMMAND test_partial_decode_limits decode_area_iso
+    ${OPJ_DATA_ROOT}/input/conformance/p0_12.j2k)
 endif()
 
 add_test(NAME tda_prep_reversible_no_precinct COMMAND test_tile_encoder 1 256 256 32 32 8 0 reversible_no_precinct.j2k 4 4 3 0 0 1)
