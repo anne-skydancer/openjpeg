@@ -177,7 +177,7 @@ static OPJ_BOOL opj_j2k_update_rates(opj_j2k_t *p_j2k,
  * tile parameters (made by opj_j2k_init_tile_parameters when the tile appears in
  * the codestream). Creates also the tile decoder.
  */
-static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
+static OPJ_BOOL opj_j2k_prepare_tcps_and_create_tcd(opj_j2k_t * p_j2k,
         opj_stream_private_t *p_stream,
         opj_event_mgr_t * p_manager);
 
@@ -8677,7 +8677,7 @@ static OPJ_BOOL opj_j2k_setup_header_reading(opj_j2k_t *p_j2k,
 
     /* DEVELOPER CORNER, add your custom procedures */
     if (! opj_procedure_list_add_procedure(p_j2k->m_procedure_list,
-                                           (opj_procedure)opj_j2k_copy_default_tcp_and_create_tcd, p_manager))  {
+                                           (opj_procedure)opj_j2k_prepare_tcps_and_create_tcd, p_manager))  {
         return OPJ_FALSE;
     }
 
@@ -9310,10 +9310,10 @@ static OPJ_BOOL opj_j2k_exec(opj_j2k_t * p_j2k,
     return l_result;
 }
 
-static OPJ_BOOL opj_j2k_copy_default_tcp_and_create_tcd(opj_j2k_t * p_j2k,
+static OPJ_BOOL opj_j2k_prepare_tcps_and_create_tcd(opj_j2k_t * p_j2k,
         opj_stream_private_t *p_stream,
         opj_event_mgr_t * p_manager
-                                                       )
+                                                   )
 {
     opj_tcp_t * l_tcp = 00;
     OPJ_UINT32 l_nb_tiles;

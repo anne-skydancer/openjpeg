@@ -1402,7 +1402,10 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_setup_decoder(opj_codec_t *p_codec,
  * will be disabled.
  * If strict decoding is disabled, the decoder will decode partial
  * bitstreams as much as possible without erroring, and the TPSOT fixing logic
- * will be enabled.
+ * will be enabled. A packet whose header the data cuts, or whose EPH marker it
+ * leaves out, then counts as absent and the decode goes on, so a hostile
+ * codestream can make it work longer than strict decoding, which fails there:
+ * bound that work with opj_decoder_set_limits().
  *
  * @param p_codec       decompressor handler
  * @param strict        OPJ_TRUE to enable strict decoding, OPJ_FALSE to disable
