@@ -141,7 +141,10 @@ typedef struct opj_tcd_cblk_dec {
     OPJ_UINT32 numchunksalloc;      /* Number of chunks item allocated */
     /* Decoded code-block. Only used for subtile decoding. Otherwise tilec->data is directly updated */
     OPJ_INT32* decoded_data;
-    OPJ_BOOL corrupted; /* whether the code block data is corrupted */
+    /* Decoding: the code-block lost passes of a packet (its data ended, non-strict
+     * mode). Later packets add no passes to it, since they would decode out of
+     * place; what it got before decodes as usual */
+    OPJ_BOOL corrupted;
 } opj_tcd_cblk_dec_t;
 
 /** Precinct structure */
