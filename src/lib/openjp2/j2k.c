@@ -2766,6 +2766,14 @@ static OPJ_BOOL opj_j2k_read_cod(opj_j2k_t *p_j2k,
         return OPJ_FALSE;
     }
 
+    if (l_cp->m_specific_param.m_dec.m_limits.max_layers != 0U &&
+            l_tcp->numlayers > l_cp->m_specific_param.m_dec.m_limits.max_layers) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "Error with COD marker: %u layers exceed the decoder's limit of %u\n",
+                      l_tcp->numlayers, l_cp->m_specific_param.m_dec.m_limits.max_layers);
+        return OPJ_FALSE;
+    }
+
     /* If user didn't set a number layer to decode take the max specify in the codestream. */
     if (l_cp->m_specific_param.m_dec.m_layer) {
         l_tcp->num_layers_to_decode = l_cp->m_specific_param.m_dec.m_layer;

@@ -633,6 +633,9 @@ typedef struct opj_decoder_limits {
     OPJ_UINT32 max_tiles;
     /** Components of the image (SIZ marker), checked when the main header is read. */
     OPJ_UINT32 max_components;
+    /** Quality layers (COD marker of the main header and of each tile), checked as each
+     * COD marker is read. */
+    OPJ_UINT32 max_layers;
     /** Width and height of every component at the decoded resolution, after the reduce
      * factor, checked when opj_decode() or opj_get_decoded_tile() starts. */
     OPJ_UINT32 max_decoded_side;
@@ -647,8 +650,8 @@ typedef struct opj_decoder_limits {
 /** No limits: OpenJPEG's own behaviour, the default of every decoder. */
 #define OPJ_DECODER_LIMITS_NONE        0
 /**
- * Second Life textures: 1,024 tiles, 8 components, 2,048 pixels per side at the decoded
- * resolution and 256 MiB of working memory.
+ * Second Life textures: 1,024 tiles, 8 components, 64 quality layers, 2,048 pixels per
+ * side at the decoded resolution and 256 MiB of working memory.
  */
 #define OPJ_DECODER_LIMITS_SL_TEXTURE  1
 

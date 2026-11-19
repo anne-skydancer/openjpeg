@@ -57,6 +57,10 @@ typedef struct opj_t2 {
     opj_image_t *image;
     /** pointer to the image coding parameters */
     opj_cp_t *cp;
+    /** Decoding: a missing SOP marker was reported (once per tile) */
+    OPJ_BOOL sop_warned;
+    /** Decoding: a segment cut by the end of the data was reported (once per tile) */
+    OPJ_BOOL cut_warned;
 } opj_t2_t;
 
 /** @name Exported functions */
