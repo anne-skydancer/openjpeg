@@ -350,6 +350,11 @@ typedef struct opj_decoding_param {
     OPJ_UINT32 m_layer;
     /** resource limits (opj_decoder_set_limits); every limit is 0 (none) unless set */
     opj_decoder_limits_t m_limits;
+    /** with a memory limit: the bytes of the tile parameters the main header made */
+    OPJ_UINT64 m_header_memory;
+    /** with a memory limit: the bytes counted against it, those of the tile
+     * parameters and of every tile decode since the decode started */
+    OPJ_UINT64 m_memory;
 }
 opj_decoding_param_t;
 

@@ -489,11 +489,13 @@ OPJ_BOOL OPJ_CALLCONV opj_decoder_limits_init(opj_decoder_limits_t *p_limits,
     case OPJ_DECODER_LIMITS_SL_TEXTURE:
         /* The caps follow the viewer's own rules (at most 8 components, 2048 pixels
          * per side at the decoded resolution, 256 MiB for a raw image) and bound what
-         * a hostile header can make the decoder allocate: about 6 MB of tile
+         * a hostile header can make the decoder allocate and do: about 6 MB of tile
          * parameters for 1,024 tiles, 128 MiB of samples (2048 x 2048 x 8 x 4 bytes)
-         * at the decoded resolution, and 256 MiB for the decode of one tile; 64
-         * layers bound the packets a tile can declare. They are far above the
-         * textures Second Life serves (one tile, up to 5 components, 8 layers). */
+         * at the decoded resolution, and 256 MiB for all the tiles of one decode,
+         * which also bounds its work; 64 layers bound the packets a tile can
+         * declare. They are far above the textures Second Life serves (one tile, up
+         * to 5 components, 8 layers), and 1,024 tiles keep tiled local files of up
+         * to 16,384 pixels per side (512 x 512 tiles) decodable. */
         p_limits->max_tiles = 1024;
         p_limits->max_components = 8;
         p_limits->max_layers = 64;

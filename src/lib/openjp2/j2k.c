@@ -2377,14 +2377,19 @@ static OPJ_BOOL opj_j2k_read_siz(opj_j2k_t *p_j2k,
     }
     /* What the header makes the decoder allocate per tile: the tile coding
      * parameters and the tile's codestream index entry. The rest of a tile's
-     * parameters is allocated only for tiles that appear in the codestream. */
-    if (l_limits->max_memory != 0U &&
-            (OPJ_UINT64)l_nb_tiles * (sizeof(opj_tcp_t) + sizeof(opj_tile_index_t)) >
-            l_limits->max_memory) {
-        opj_event_msg(p_manager, EVT_ERROR,
-                      "Error with SIZ marker: the parameters of %u tiles exceed the decoder's memory limit\n",
-                      l_nb_tiles);
-        return OPJ_FALSE;
+     * parameters is allocated only for tiles that appear in the codestream.
+     * These bytes count against the memory limit for every decode. */
+    if (l_limits->max_memory != 0U) {
+        const OPJ_UINT64 l_header_memory = (OPJ_UINT64)l_nb_tiles *
+                                           (sizeof(opj_tcp_t) + sizeof(opj_tile_index_t));
+        if (l_header_memory > l_limits->max_memory) {
+            opj_event_msg(p_manager, EVT_ERROR,
+                          "Error with SIZ marker: the parameters of %u tiles exceed the decoder's memory limit\n",
+                          l_nb_tiles);
+            return OPJ_FALSE;
+        }
+        l_cp->m_specific_param.m_dec.m_header_memory = l_header_memory;
+        l_cp->m_specific_param.m_dec.m_memory = l_header_memory;
     }
 
     /* Define the tiles which will be decoded */
@@ -12536,17 +12541,20 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
 }
 
 /**
- * Checks the size of every component of the image to decode, at the decoded
- * resolution, against the decoder's max_decoded_side limit.
+ * Starts a decode under the decoder's limits: checks the size of every
+ * component of the image to decode, at the decoded resolution, against the
+ * max_decoded_side limit, and starts the decode's count against the memory
+ * limit (the tile parameters of the main header count for every decode).
  */
-static OPJ_BOOL opj_j2k_check_decoded_side(const opj_j2k_t * p_j2k,
+static OPJ_BOOL opj_j2k_start_limited_decode(opj_j2k_t * p_j2k,
         const opj_image_t * p_image,
         opj_event_mgr_t * p_manager)
 {
-    const OPJ_UINT32 l_max_side =
-        p_j2k->m_cp.m_specific_param.m_dec.m_limits.max_decoded_side;
+    opj_decoding_param_t * l_dec = &(p_j2k->m_cp.m_specific_param.m_dec);
+    const OPJ_UINT32 l_max_side = l_dec->m_limits.max_decoded_side;
     OPJ_UINT32 compno;
 
+    l_dec->m_memory = l_dec->m_header_memory;
     if (l_max_side == 0U) {
         return OPJ_TRUE;
     }
@@ -12596,7 +12604,7 @@ OPJ_BOOL opj_j2k_decode(opj_j2k_t * p_j2k,
         }
     }
 
-    if (!opj_j2k_check_decoded_side(p_j2k, p_image, p_manager)) {
+    if (!opj_j2k_start_limited_decode(p_j2k, p_image, p_manager)) {
         return OPJ_FALSE;
     }
 
@@ -12707,7 +12715,7 @@ OPJ_BOOL opj_j2k_get_tile(opj_j2k_t *p_j2k,
         p_image->numcomps = p_j2k->m_private_image->numcomps;
     }
 
-    if (!opj_j2k_check_decoded_side(p_j2k, p_image, p_manager)) {
+    if (!opj_j2k_start_limited_decode(p_j2k, p_image, p_manager)) {
         return OPJ_FALSE;
     }
 

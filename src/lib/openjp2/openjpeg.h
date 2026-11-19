@@ -624,9 +624,9 @@ typedef struct opj_dparameters {
  *
  * The decoder checks each limit from the codestream's headers before it allocates what the
  * limit bounds, and refuses a codestream that exceeds one: opj_read_header() or opj_decode()
- * then fails with an error message. A limit of 0 means no limit, and a decoder that is given
- * no limits behaves as OpenJPEG always did. Fill the structure with opj_decoder_limits_init()
- * and change single fields afterwards if needed.
+ * then fails with an error message. A limit of 0 means no limit; with every limit at 0, the
+ * default of every decoder, the limits change nothing. Fill the structure with
+ * opj_decoder_limits_init() and change single fields afterwards if needed.
  * */
 typedef struct opj_decoder_limits {
     /** Tiles of the image (SIZ marker), checked when the main header is read. */
@@ -639,11 +639,15 @@ typedef struct opj_decoder_limits {
     /** Width and height of every component at the decoded resolution, after the reduce
      * factor, checked when opj_decode() or opj_get_decoded_tile() starts. */
     OPJ_UINT32 max_decoded_side;
-    /** Bytes the decoder may allocate, checked against two needs computed from the headers,
-     * each on its own: the tile parameters of the whole codestream (when the main header is
-     * read), and the decode of one tile (code-block and precinct structures of every
-     * resolution, samples at the decoded resolution, packet iterator table), checked before
-     * each of those allocations. */
+    /** Bytes that one decode (an opj_decode() or opj_get_decoded_tile() call, or the tiles
+     * read with opj_read_tile_header() after opj_read_header()) allocates for what the
+     * headers determine, summed over its tiles: the tile parameters of the main header and,
+     * for each tile before anything is allocated for it, its resolution, precinct and
+     * code-block structures of every resolution, tag trees, samples at the decoded
+     * resolution and packet iterator table. Not counted: what the compressed data adds as it
+     * is read (the data itself, more code-block segments, data chunks); the output image of
+     * a multi-tile decode and the buffers of a decode area (both bounded by max_decoded_side
+     * and max_components); Tier-1 and wavelet work buffers. */
     OPJ_UINT64 max_memory;
 } opj_decoder_limits_t;
 
@@ -651,7 +655,7 @@ typedef struct opj_decoder_limits {
 #define OPJ_DECODER_LIMITS_NONE        0
 /**
  * Second Life textures: 1,024 tiles, 8 components, 64 quality layers, 2,048 pixels per
- * side at the decoded resolution and 256 MiB of working memory.
+ * side at the decoded resolution and 256 MiB for one decode.
  */
 #define OPJ_DECODER_LIMITS_SL_TEXTURE  1
 
