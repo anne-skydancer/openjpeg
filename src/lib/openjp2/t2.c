@@ -1272,6 +1272,13 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
             /* EPH markers are required */
             if ((*l_modified_length_ptr - (OPJ_UINT32)(l_header_data -
                     *l_header_data_start)) < 2U) {
+                if (!l_cp->strict) {
+                    /* The data ended before the EPH marker: the packet is
+                     * absent, and the rest of the tile's data counts as read */
+                    *p_is_data_present = OPJ_FALSE;
+                    *p_data_read = p_max_length;
+                    return OPJ_TRUE;
+                }
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Not enough space for required EPH marker\n");
                 return OPJ_FALSE;
@@ -1467,6 +1474,15 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
         /* EPH markers are required */
         if ((*l_modified_length_ptr - (OPJ_UINT32)(l_header_data -
                 *l_header_data_start)) < 2U) {
+            if (!l_cp->strict) {
+                /* The data ended before the EPH marker: the passes this header
+                 * announced have no data, the packet is absent, and the rest of
+                 * the tile's data counts as read */
+                opj_t2_drop_new_passes(l_res, p_pi->precno);
+                *p_is_data_present = OPJ_FALSE;
+                *p_data_read = p_max_length;
+                return OPJ_TRUE;
+            }
             opj_event_msg(p_manager, EVT_ERROR,
                           "Not enough space for required EPH marker\n");
             return OPJ_FALSE;
