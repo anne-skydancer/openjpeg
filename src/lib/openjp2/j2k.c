@@ -5021,6 +5021,48 @@ static OPJ_BOOL opj_j2k_write_sod(opj_j2k_t *p_j2k,
     return OPJ_TRUE;
 }
 
+/**
+ * Finds whether the codestream ends with an EOC marker (its last two bytes) and
+ * puts the stream back where it was. A stream that cannot seek is taken to end
+ * with one, as OpenJPEG always assumed for a tile-part with Psot = 0.
+ *
+ * @param       p_stream        the stream, at the start of the last tile-part's data.
+ * @param       p_bytes_left    the bytes left in the stream.
+ * @param       p_ends_with_eoc set to whether the last two bytes are an EOC marker.
+ * @param       p_manager       the user event manager.
+ *
+ * @return      OPJ_FALSE if the stream could not be put back where it was.
+ */
+static OPJ_BOOL opj_j2k_find_final_eoc(opj_stream_private_t *p_stream,
+                                       OPJ_OFF_T p_bytes_left,
+                                       OPJ_BOOL * p_ends_with_eoc,
+                                       opj_event_mgr_t * p_manager)
+{
+    OPJ_BYTE l_bytes[2];
+    OPJ_UINT32 l_marker = 0;
+    OPJ_OFF_T l_pos;
+
+    *p_ends_with_eoc = OPJ_TRUE;
+    if (p_bytes_left < 2) {
+        *p_ends_with_eoc = OPJ_FALSE;
+        return OPJ_TRUE;
+    }
+    if (!opj_stream_has_seek(p_stream)) {
+        return OPJ_TRUE;
+    }
+    l_pos = opj_stream_tell(p_stream);
+    if (opj_stream_read_seek(p_stream, l_pos + p_bytes_left - 2, p_manager) &&
+            opj_stream_read_data(p_stream, l_bytes, 2, p_manager) == 2) {
+        opj_read_bytes(l_bytes, &l_marker, 2);
+        *p_ends_with_eoc = (l_marker == J2K_MS_EOC) ? OPJ_TRUE : OPJ_FALSE;
+    }
+    if (!opj_stream_read_seek(p_stream, l_pos, p_manager)) {
+        opj_event_msg(p_manager, EVT_ERROR, "Problem with seek function\n");
+        return OPJ_FALSE;
+    }
+    return OPJ_TRUE;
+}
+
 static OPJ_BOOL opj_j2k_read_sod(opj_j2k_t *p_j2k,
                                  opj_stream_private_t *p_stream,
                                  opj_event_mgr_t * p_manager
@@ -5045,8 +5087,23 @@ static OPJ_BOOL opj_j2k_read_sod(opj_j2k_t *p_j2k,
         // but we are in the last tile part,
         // so its result will fit on OPJ_UINT32 unless we find
         // a file with a single tile part of more than 4 GB...*/
-        p_j2k->m_specific_param.m_decoder.m_sot_length = (OPJ_UINT32)(
-                    opj_stream_get_number_byte_left(p_stream) - 2);
+        const OPJ_OFF_T l_bytes_left = opj_stream_get_number_byte_left(p_stream);
+        OPJ_BOOL l_ends_with_eoc = OPJ_TRUE;
+        if (!p_j2k->m_cp.strict &&
+                !opj_j2k_find_final_eoc(p_stream, l_bytes_left, &l_ends_with_eoc,
+                                        p_manager)) {
+            return OPJ_FALSE;
+        }
+        if (!l_ends_with_eoc) {
+            /* Psot = 0 runs the tile-part to the EOC marker, but a cut
+             * codestream has none: all remaining bytes are tile data (the
+             * subtraction below would drop the last 2 of them, or wrap
+             * below 2 bytes) */
+            p_j2k->m_specific_param.m_decoder.m_sot_length = (OPJ_UINT32)l_bytes_left;
+        } else {
+            p_j2k->m_specific_param.m_decoder.m_sot_length = (OPJ_UINT32)(
+                        l_bytes_left - 2);
+        }
     } else {
         /* Check to avoid pass the limit of OPJ_UINT32 */
         if (p_j2k->m_specific_param.m_decoder.m_sot_length >= 2) {
@@ -10100,6 +10157,16 @@ OPJ_BOOL opj_j2k_read_tile_header(opj_j2k_t * p_j2k,
             p_j2k->m_specific_param.m_decoder.m_skip_data = 0;
             p_j2k->m_specific_param.m_decoder.m_can_decode = 0;
             p_j2k->m_specific_param.m_decoder.m_state = J2K_STATE_TPHSOT;
+        }
+
+        if (! p_j2k->m_specific_param.m_decoder.m_can_decode &&
+                !p_j2k->m_cp.strict &&
+                p_j2k->m_specific_param.m_decoder.m_last_tile_part &&
+                opj_stream_get_number_byte_left(p_stream) == 0) {
+            /* The last tile-part (Psot = 0) of a cut codestream took every byte
+             * left (opj_j2k_read_sod): the codestream ends here, without EOC */
+            p_j2k->m_specific_param.m_decoder.m_state = J2K_STATE_NEOC;
+            break;
         }
 
         if (! p_j2k->m_specific_param.m_decoder.m_can_decode) {

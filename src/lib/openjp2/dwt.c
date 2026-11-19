@@ -3631,7 +3631,10 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
     OPJ_SIZE_T l_data_size;
     const int num_threads = opj_thread_pool_get_thread_count(tp);
 
-    if (numres == 1) {
+    /* A tile-component that vanishes at the decoded resolution (w == 0) has
+     * nothing to transform, as in the 5/3 path (issue #1505); without this,
+     * its zero-size buffer request fails the tile */
+    if (numres == 1 || w == 0) {
         return OPJ_TRUE;
     }
 
