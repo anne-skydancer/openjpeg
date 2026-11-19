@@ -631,7 +631,8 @@ typedef struct opj_dparameters {
 typedef struct opj_decoder_limits {
     /** Tiles of the image (SIZ marker), checked when the main header is read. */
     OPJ_UINT32 max_tiles;
-    /** Components of the image (SIZ marker), checked when the main header is read. */
+    /** Components of the image (SIZ marker), checked when the main header is read, and the
+     * components a JP2 palette (pclr box) would expand the image to. */
     OPJ_UINT32 max_components;
     /** Quality layers (COD marker of the main header and of each tile), checked as each
      * COD marker is read. */
@@ -646,8 +647,8 @@ typedef struct opj_decoder_limits {
      * code-block structures of every resolution, tag trees, samples at the decoded
      * resolution and packet iterator table. Not counted: what the compressed data adds as it
      * is read (the data itself, more code-block segments, data chunks); the output image of
-     * a multi-tile decode and the buffers of a decode area (both bounded by max_decoded_side
-     * and max_components); Tier-1 and wavelet work buffers. */
+     * a multi-tile decode, the buffers of a decode area and a JP2 palette's components (all
+     * bounded by max_decoded_side and max_components); Tier-1 and wavelet work buffers. */
     OPJ_UINT64 max_memory;
 } opj_decoder_limits_t;
 

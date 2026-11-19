@@ -1613,6 +1613,18 @@ static OPJ_BOOL opj_jp2_apply_color_postprocessing(opj_jp2_t *jp2,
             if (!jp2->color.jp2_pclr->cmap) {
                 opj_jp2_free_pclr(&(jp2->color));
             } else {
+                /* The palette expands the image to one full-size component per
+                 * palette column: they count against the decoder's component
+                 * limit (opj_decoder_limits_t::max_components) */
+                const OPJ_UINT32 l_max_comps =
+                    jp2->j2k->m_cp.m_specific_param.m_dec.m_limits.max_components;
+                if (l_max_comps != 0U &&
+                        jp2->color.jp2_pclr->nr_channels > l_max_comps) {
+                    opj_event_msg(p_manager, EVT_ERROR,
+                                  "The palette (pclr box) makes %u components, more than the decoder's limit of %u\n",
+                                  (OPJ_UINT32)jp2->color.jp2_pclr->nr_channels, l_max_comps);
+                    return OPJ_FALSE;
+                }
                 if (!opj_jp2_apply_pclr(p_image, &(jp2->color), p_manager)) {
                     return OPJ_FALSE;
                 }
