@@ -8,7 +8,9 @@ rem   pkgdll  the same DLL with link-time code generation, as the Windows packag
 rem   san     clang-cl ASan+UBSan, static, codec tools, NDEBUG as shipped. Not for timing.
 rem   sandbg  the same with assertions on (no NDEBUG): they check, among others, that
 rem           opj_tcd_decode_need covers what opj_tcd_init_tile builds
-rem usage: build_lib.cmd rel|dll|pkgdll|san|sandbg <src dir> <build dir> [extra C flags]
+rem   census  the rel flags with OPJ_ALLOC_CENSUS, library only, for a tree patched by
+rem           make_variant_src.py census (the probe counts the allocation calls)
+rem usage: build_lib.cmd rel|dll|pkgdll|san|sandbg|census <src dir> <build dir> [extra C flags]
 rem   VCVARS: vcvars64.bat of Visual Studio (default: VS 2026 Community)
 rem   OPJ_LLVM_RT (san, sandbg): a folder without spaces holding the clang runtime import libraries
 rem     (clang_rt.asan_dynamic-x86_64.lib, clang_rt.asan_dynamic_runtime_thunk-x86_64.lib)
@@ -16,8 +18,8 @@ setlocal
 if "%VCVARS%"=="" set VCVARS=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat
 call "%VCVARS%" >nul 2>nul
 set KIND=%~1
-if not "%KIND%"=="rel" if not "%KIND%"=="dll" if not "%KIND%"=="pkgdll" if not "%KIND%"=="san" if not "%KIND%"=="sandbg" (
-  echo usage: build_lib.cmd rel^|dll^|pkgdll^|san^|sandbg ^<src dir^> ^<build dir^> [extra C flags]
+if not "%KIND%"=="rel" if not "%KIND%"=="dll" if not "%KIND%"=="pkgdll" if not "%KIND%"=="san" if not "%KIND%"=="sandbg" if not "%KIND%"=="census" (
+  echo usage: build_lib.cmd rel^|dll^|pkgdll^|san^|sandbg^|census ^<src dir^> ^<build dir^> [extra C flags]
   exit /b 1
 )
 set SRC=%~2
@@ -38,6 +40,12 @@ if "%KIND%"=="rel" (
     -DCMAKE_C_FLAGS="%CPU% %EXTRA%" -DCMAKE_C_FLAGS_RELEASE="/DNDEBUG" ^
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON ^
     -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DBUILD_CODEC=OFF %OPTS% || exit /b 1
+) else if "%KIND%"=="census" (
+  cmake -S "%SRC%" -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl ^
+    -DCMAKE_C_FLAGS="%CPU% /DOPJ_ALLOC_CENSUS %EXTRA%" -DCMAKE_C_FLAGS_RELEASE="/DNDEBUG" ^
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_CODEC=OFF %OPTS% || exit /b 1
+  cmake --build "%BLD%" --target openjp2 -- -j 6 || exit /b 1
+  exit /b 0
 ) else (
   if "%OPJ_LLVM_RT%"=="" (
     echo set OPJ_LLVM_RT to the folder of the clang runtime import libraries

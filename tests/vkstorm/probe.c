@@ -15,10 +15,11 @@
  *   census <file> <reduce> [repeat]          allocation census (only with the census build)
  *   layhash <file> <reduce list> <layers>    whole-file hashes limited to 1..layers layers (cp_layer),
  *                                            in the cuthash format: the oracle of b5_check.py
- *   cache <entries> <cache dir> <reduce>     the viewer cache's headers under the limits profile
+ *   cache <texture.entries> <texture.cache> <reduce>  the viewer cache's headers under the limits profile
  * PROBE_PROFILE=sl in the environment selects the decoder limits profile OPJ_DECODER_LIMITS_SL_TEXTURE
  * (only in builds with PROBE_LIMITS, against a library that has opj_decoder_set_limits).
- * PROBE_LAYERS=<n> limits every decode to n layers (cp_layer); PROBE_JP2=1 decodes JP2 files.
+ * PROBE_LAYERS=<n> limits every decode to n layers (cp_layer); PROBE_JP2=1 decodes JP2 files;
+ * PROBE_STRICT=1 decodes in strict mode (OpenJPEG's default) instead of the viewer's non-strict mode.
  * Not a viewer component; nothing here ships.
  */
 #include <windows.h>
@@ -75,6 +76,7 @@ static int g_profile = 0; /* 1: OPJ_DECODER_LIMITS_SL_TEXTURE */
 static unsigned g_layers =
     0; /* cp_layer of every decode (PROBE_LAYERS), 0: all */
 static int g_jp2 = 0; /* PROBE_JP2=1: decode as JP2 (OPJ_CODEC_JP2) */
+static int g_strict = 0; /* PROBE_STRICT=1: every decode in strict mode */
 
 static void apply_profile(opj_codec_t *c)
 {
@@ -152,7 +154,7 @@ static opj_image_t *decode_mem(const unsigned char *buf, size_t len, int reduce,
     opj_stream_set_skip_function(s, mem_skip);
     opj_stream_set_seek_function(s, mem_seek);
     opj_set_decoded_resolution_factor(c, (OPJ_UINT32)reduce);
-    opj_decoder_set_strict_mode(c, strict ? OPJ_TRUE : OPJ_FALSE);
+    opj_decoder_set_strict_mode(c, (strict || g_strict) ? OPJ_TRUE : OPJ_FALSE);
     apply_profile(c);
     *stage = 0;
     if (!opj_read_header(s, c, &img)) {
@@ -1334,6 +1336,10 @@ int main(int argc, char **argv)
     {
         const char *pj = getenv("PROBE_JP2");
         g_jp2 = (pj && pj[0] == '1') ? 1 : 0;
+    }
+    {
+        const char *ps = getenv("PROBE_STRICT");
+        g_strict = (ps && ps[0] == '1') ? 1 : 0;
     }
     if (argc >= 5 && !strcmp(argv[1], "cache")) {
         return cmd_cache(argv[2], argv[3], atoi(argv[4]));
