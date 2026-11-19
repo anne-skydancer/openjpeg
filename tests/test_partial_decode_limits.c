@@ -735,7 +735,7 @@ static void test_limits(void)
 
 static void test_psot0(void)
 {
-    buffer_t in = encode(64, 64, 3, 5, 3, 0, 0), zero;
+    buffer_t in = encode(32, 32, 3, 4, 3, 0, 0), zero;
     size_t sot, len, start;
     unsigned differ = 0, decoded = 0;
 
