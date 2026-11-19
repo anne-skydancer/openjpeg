@@ -64,6 +64,8 @@ typedef struct opj_bio {
     OPJ_UINT32 buf;
     /** coder : number of bits free to write. decoder : number of bits read */
     OPJ_UINT32 ct;
+    /** decoder: a read needed a byte past the end of the buffer */
+    OPJ_BOOL overrun;
 } opj_bio_t;
 
 /** @name Exported functions */

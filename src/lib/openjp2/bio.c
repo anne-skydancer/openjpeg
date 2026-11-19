@@ -88,6 +88,7 @@ static OPJ_BOOL opj_bio_bytein(opj_bio_t *bio)
     bio->buf = (bio->buf << 8) & 0xffff;
     bio->ct = bio->buf == 0xff00 ? 7 : 8;
     if ((OPJ_SIZE_T)bio->bp >= (OPJ_SIZE_T)bio->end) {
+        bio->overrun = OPJ_TRUE;
         return OPJ_FALSE;
     }
     bio->buf |= *bio->bp++;
@@ -135,6 +136,7 @@ void opj_bio_init_enc(opj_bio_t *bio, OPJ_BYTE *bp, OPJ_UINT32 len)
     bio->bp = bp;
     bio->buf = 0;
     bio->ct = 8;
+    bio->overrun = OPJ_FALSE;
 }
 
 void opj_bio_init_dec(opj_bio_t *bio, OPJ_BYTE *bp, OPJ_UINT32 len)
@@ -144,6 +146,7 @@ void opj_bio_init_dec(opj_bio_t *bio, OPJ_BYTE *bp, OPJ_UINT32 len)
     bio->bp = bp;
     bio->buf = 0;
     bio->ct = 0;
+    bio->overrun = OPJ_FALSE;
 }
 
 void opj_bio_putbit(opj_bio_t *bio, OPJ_UINT32 b)

@@ -157,6 +157,15 @@ static OPJ_BOOL opj_t2_init_seg(opj_tcd_cblk_dec_t* cblk,
                                 OPJ_UINT32 cblksty,
                                 OPJ_UINT32 first);
 
+/**
+Leave out the passes a packet header announced for the code-blocks of one precinct
+(the packet is absent); what earlier packets gave the code-blocks stays.
+@param res      Resolution of the packet
+@param precno   Precinct of the packet
+*/
+static void opj_t2_drop_new_passes(opj_tcd_resolution_t *res,
+                                   OPJ_UINT32 precno);
+
 /*@}*/
 
 /*@}*/
@@ -1005,6 +1014,29 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
     return OPJ_TRUE;
 }
 
+static void opj_t2_drop_new_passes(opj_tcd_resolution_t *res,
+                                   OPJ_UINT32 precno)
+{
+    OPJ_UINT32 bandno, cblkno;
+    opj_tcd_band_t *l_band = res->bands;
+
+    for (bandno = 0; bandno < res->numbands; ++bandno, ++l_band) {
+        opj_tcd_precinct_t *l_prc;
+        opj_tcd_cblk_dec_t *l_cblk;
+        OPJ_UINT32 l_nb_code_blocks;
+
+        if (opj_tcd_is_band_empty(l_band)) {
+            continue;
+        }
+        l_prc = &l_band->precincts[precno];
+        l_cblk = l_prc->cblks.dec;
+        l_nb_code_blocks = l_prc->cw * l_prc->ch;
+        for (cblkno = 0; cblkno < l_nb_code_blocks; ++cblkno, ++l_cblk) {
+            l_cblk->numnewpasses = 0;
+        }
+    }
+}
+
 static OPJ_BOOL opj_t2_skip_packet(opj_t2_t* p_t2,
                                    opj_tcd_tile_t *p_tile,
                                    opj_tcp_t *p_tcp,
@@ -1157,10 +1189,19 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
     l_present = opj_bio_read(l_bio, 1);
     JAS_FPRINTF(stderr, "present=%d \n", l_present);
     if (!l_present) {
+        OPJ_BOOL l_cut;
         /* TODO MSD: no test to control the output of this function*/
-        opj_bio_inalign(l_bio);
+        l_cut = !opj_bio_inalign(l_bio) || l_bio->overrun;
         l_header_data += opj_bio_numbytes(l_bio);
         opj_bio_destroy(l_bio);
+
+        if (l_cut && !l_cp->strict) {
+            /* The data ended inside this packet header: the packet is absent, and the
+             * rest of the tile's data counts as read */
+            *p_is_data_present = OPJ_FALSE;
+            *p_data_read = p_max_length;
+            return OPJ_TRUE;
+        }
 
         /* EPH markers */
         if (p_tcp->csty & J2K_CP_CSTY_EPH) {
@@ -1334,9 +1375,24 @@ static OPJ_BOOL opj_t2_read_packet_header(opj_t2_t* p_t2,
         }
     }
 
-    if (!opj_bio_inalign(l_bio)) {
-        opj_bio_destroy(l_bio);
-        return OPJ_FALSE;
+    {
+        const OPJ_BOOL l_aligned = opj_bio_inalign(l_bio);
+        if ((!l_aligned || l_bio->overrun) && !l_cp->strict) {
+            /* The data ended inside this packet header (the bit reader ran past the
+             * end, or the stuffed byte after 0xFF is missing). Header bits past the end
+             * read as zeros and could announce passes that have no data: the packet is
+             * absent, everything earlier packets gave stays, and the rest of the tile's
+             * data counts as read */
+            opj_bio_destroy(l_bio);
+            opj_t2_drop_new_passes(l_res, p_pi->precno);
+            *p_is_data_present = OPJ_FALSE;
+            *p_data_read = p_max_length;
+            return OPJ_TRUE;
+        }
+        if (!l_aligned) {
+            opj_bio_destroy(l_bio);
+            return OPJ_FALSE;
+        }
     }
 
     l_header_data += opj_bio_numbytes(l_bio);
@@ -1422,13 +1478,11 @@ static OPJ_BOOL opj_t2_read_packet_data(opj_t2_t* p_t2,
                 continue;
             }
 
-            if (partial_buffer || l_cblk->corrupted) {
-                /* if a previous segment in this packet couldn't be decoded,
-                 * or if this code block was corrupted in a previous layer,
-                 * then mark it as corrupted.
-                 */
-                l_cblk->numchunks = 0;
-                l_cblk->corrupted = OPJ_TRUE;
+            if (partial_buffer) {
+                /* The packet's data ended before this code-block's contribution:
+                 * this packet's passes are left out, and everything earlier packets
+                 * gave the code-block stays */
+                l_cblk->numnewpasses = 0;
                 continue;
             }
 
@@ -1461,12 +1515,18 @@ static OPJ_BOOL opj_t2_read_packet_data(opj_t2_t* p_t2,
                                       "read: segment too long (%d) with max (%d) for codeblock %d (p=%d, b=%d, r=%d, c=%d)\n",
                                       l_seg->newlen, p_max_length, cblkno, p_pi->precno, bandno, p_pi->resno,
                                       p_pi->compno);
-                        /* skip this codeblock (and following ones in this
-                         * packet) since it is a partial read
-                         */
+                        /* The data ended inside this code-block's contribution. Keep
+                         * the codeword segments this packet completed before the cut
+                         * and everything earlier packets gave; drop the cut segment
+                         * and the passes after it. A segment opened for this packet
+                         * that got no data is closed again, so real_num_segs counts
+                         * only segments with data. The code-blocks after this one get
+                         * no new passes from this packet */
                         partial_buffer = OPJ_TRUE;
-                        l_cblk->corrupted = OPJ_TRUE;
-                        l_cblk->numchunks = 0;
+                        if (l_seg->numpasses == 0 && l_cblk->numsegs > 0) {
+                            --l_cblk->numsegs;
+                        }
+                        l_cblk->numnewpasses = 0;
                         break;
                     }
                 }
