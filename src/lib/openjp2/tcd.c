@@ -551,8 +551,8 @@ OPJ_BOOL opj_tcd_rateallocate(opj_tcd_t *tcd,
             } /* bandno */
         } /* resno */
 
-        maxSE += (((OPJ_FLOAT64)(1 << tcd->image->comps[compno].prec) - 1.0)
-                  * ((OPJ_FLOAT64)(1 << tcd->image->comps[compno].prec) - 1.0))
+        maxSE += (((OPJ_FLOAT64)(1U << tcd->image->comps[compno].prec) - 1.0)
+                  * ((OPJ_FLOAT64)(1U << tcd->image->comps[compno].prec) - 1.0))
                  * ((OPJ_FLOAT64)(tilec->numpix));
     } /* compno */
 

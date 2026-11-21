@@ -19,3 +19,7 @@ endforeach()
 add_executable(testjp2 testjp2.c)
 target_link_libraries(testjp2 openjp2)
 add_test(NAME testjp2 COMMAND testjp2 ${OPJ_DATA_ROOT})
+
+add_executable(testresolutions testresolutions.c)
+target_link_libraries(testresolutions openjp2)
+add_test(NAME testresolutions COMMAND testresolutions)
